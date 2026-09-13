@@ -53,6 +53,8 @@ pub use storage_bucket_internals::{
 };
 pub use shard_write_guard::{index_encode_counts, reset_index_encode_counts, IndexEncodeCounts};
 mod compaction;
+// The maintenance round in `data_node` asks this before compacting; see the function's doc.
+pub use compaction::compaction_relocatable_page_refs;
 mod storage_reporting;
 pub(crate) mod hashing;
 mod bucket_store;
