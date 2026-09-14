@@ -278,16 +278,59 @@ impl TemporalEngine {
                 });
                 continue;
             }
-            if let Err(status) =
-                self.check_admission(request.shard_id, write_command, &config, &info)
-            {
-                responses.push(ExecuteResponse {
-                    status,
-                    response: CommandResponse::Empty,
-                });
-                continue;
+            // Exempt under raft apply and under replay, as the single-command path is: a
+            // follower that refuses what its leader committed diverges from the leader, and a
+            // replay that refuses a record already in the log costs the whole shard load.
+            //
+            // Both are SYMMETRY here, deliberately and stated as such. Today neither reaches
+            // this function -- execute_raft_apply_batch and batch_execute_replicated both loop
+            // over the single-command path, and replay never batches -- exactly as the
+            // recovering-shard gate above says of replaying_wal(). A future batched apply that
+            // does route here would otherwise arrive at an ungated limit, and the failure it
+            // produces (a follower quietly skipping a committed entry) is not one that shows up
+            // as an error anywhere.
+            if !raft_applying() && !replaying_wal() {
+                // Charged per COMMAND, not per batch. The single-command path spends one token a
+                // command, and a batch is not one unit of work -- a limit that counted it as one
+                // would be escaped by batching, which is how most traffic arrives here.
+                let kind = if write_command {
+                    quota::QuotaKind::Write
+                } else {
+                    quota::QuotaKind::Read
+                };
+                if !self.charge_quota(request.shard_id, kind) {
+                    responses.push(ExecuteResponse {
+                        status: Status::error(
+                            "quota_exhausted",
+                            format!(
+                                "shard {} is over its {} rate limit",
+                                request.shard_id,
+                                match kind {
+                                    quota::QuotaKind::Write => "write",
+                                    quota::QuotaKind::Read => "read",
+                                }
+                            ),
+                        ),
+                        response: CommandResponse::Empty,
+                    });
+                    continue;
+                }
+                if let Err(status) =
+                    self.check_admission(request.shard_id, write_command, &config, &info)
+                {
+                    responses.push(ExecuteResponse {
+                        status,
+                        response: CommandResponse::Empty,
+                    });
+                    continue;
+                }
             }
-            if write_command
+            // Exempt under raft apply and under replay, as the single-command path is and for
+            // the same reason. Symmetry here, on the same footing as the admission guard above:
+            // neither reaches this function today.
+            if !raft_applying()
+                && !replaying_wal()
+                && write_command
                 && config
                     .maxmemory_bytes
                     // Current on-disk footprint (GC-decremented), not cumulative-ever
