@@ -1404,6 +1404,16 @@ pub struct StorageLifecycleReport {
     #[serde(alias = "delayed_destroy_purged_segments")]
     pub delayed_destroy_purged_slabs: Vec<u64>,
     pub delayed_destroy_purged_bytes: u64,
+    /// Slabs the purge's last-chance re-check found LIVE and put back in the store.
+    ///
+    /// Reported because it is an alarm an operator has to be able to see: it means the collector
+    /// quarantined a slab something still needed, and the re-check is the only reason the bytes
+    /// are still here. A round that restores is not a round that reclaimed nothing -- it is a
+    /// round that caught a bug, and the bug is upstream of the purge.
+    #[serde(default)]
+    pub delayed_destroy_restored_slabs: Vec<u64>,
+    #[serde(default)]
+    pub delayed_destroy_restored_bytes: u64,
     #[serde(default)]
     pub manifest_prune_plan: BucketDumpManifestPrunePlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1450,6 +1460,8 @@ impl Default for StorageLifecycleReport {
             cache_warmup: StorageCacheWarmupReport::default(),
             delayed_destroy_purged_slabs: Vec::new(),
             delayed_destroy_purged_bytes: 0,
+            delayed_destroy_restored_slabs: Vec::new(),
+            delayed_destroy_restored_bytes: 0,
             manifest_prune_plan: BucketDumpManifestPrunePlan::default(),
             manifest_prune_report: None,
             install_roll_forward_reports: Vec::new(),
@@ -3171,6 +3183,13 @@ pub struct StorageLifecycleRequest {
     pub min_undumped_wal_bytes: u64,
     #[serde(default)]
     pub purge_delayed_destroy: bool,
+    /// Which quarantined slabs this round may destroy. `None` means every one old enough.
+    ///
+    /// The scheduled cycle fills this from the dependency plan's per-slab answer, so one pinned
+    /// slab no longer suppresses the destruction of the others -- and, just as importantly, a
+    /// round that runs because some slab is free cannot destroy the ones the plan blocked.
+    #[serde(default)]
+    pub purge_delayed_destroy_slab_ids: Option<Vec<u64>>,
     #[serde(default)]
     #[serde(rename = "prune_slot_dump_manifests")]
     pub prune_bucket_dump_manifests: bool,
