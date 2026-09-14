@@ -101,7 +101,7 @@ pub(super) fn object_lifecycle_report_from_entries(
             (selected_buckets.is_empty() || selected_buckets.contains(&routing_bucket))
                 && !record_exists(shard, key)
         })
-        .cloned()
+        .map(String::from)
         .collect::<Vec<_>>();
 
     StorageObjectLifecycleReport {
@@ -153,6 +153,14 @@ pub(super) fn bucket_dump_entries_by_key(
         .collect()
 }
 
+/// How many entries the dirty half of [`bucket_storage_summaries`] looks at, across every call.
+///
+/// The cost of that half is not visible from outside the function, and deriving it as "one per
+/// dirty object" is arithmetic about the code rather than a measurement of it. This counts what
+/// actually happens, so the guard keeps being true after someone changes the loop.
+pub(crate) static DIRTY_SUMMARY_VISITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(super) fn bucket_storage_summaries(
     shard: &ShardState,
     start_routing_bucket: u32,
@@ -161,10 +169,25 @@ pub(super) fn bucket_storage_summaries(
     let mut buckets = BTreeMap::<u32, BucketStorageSummary>::new();
     let mut block_slabs_by_bucket = BTreeMap::<u32, BTreeSet<u64>>::new();
     for entry in collect_live_page_entries(shard) {
-        let routing_bucket = entry
-            .address
-            .routing_bucket()
-            .unwrap_or_else(|| bucket_for_object(&entry.object_key, 0, u32::MAX));
+        // The shard's OWN routing range, which is what every other consumer of this fallback
+        // uses -- `rebuild_bucket_first_index`, `refresh_pending_bucket_runtime_flags` and the
+        // dirty-key loop at the foot of this function all reach for
+        // `page_routing_bucket(key, start, end)`. This site reached for `bucket_for_object(key,
+        // 0, u32::MAX)` instead, which is the same answer only while the shard spans the whole
+        // range. Narrow the range -- `TS_SHARD_END_ROUTING_SLOT=1023` is the setting that cuts
+        // resident memory 45% -- and the two place the same page in different buckets: this one
+        // in a bucket id above the shard's own end, no other component in agreement, and so a
+        // summary for a bucket `bucket_map` does not hold while the bucket that does hold the
+        // page reports no pages at all. A dump naming that bucket then carries no slabs for it.
+        //
+        // MEASURED FIRST: on the live write path this branch does not fire. Every one of 2 000
+        // live page entries carried an explicit routing bucket, so the count of summaries
+        // outside the range was 0 before this change as well as after it. What follows is the
+        // latent half -- an address that reaches here without one (a page rebuilt from a source
+        // that did not carry it) is placed where the rest of the engine already places it.
+        let routing_bucket = entry.address.routing_bucket().unwrap_or_else(|| {
+            page_routing_bucket(&entry.object_key, start_routing_bucket, end_routing_bucket)
+        });
         let summary = buckets.entry(routing_bucket).or_insert(BucketStorageSummary {
             routing_bucket,
             ..BucketStorageSummary::default()
@@ -210,14 +233,26 @@ pub(super) fn bucket_storage_summaries(
         summary.object_count = bucket.object_index.len() as u64;
         summary.dirty_generation = bucket.dirty_generation;
     }
-    for key in &shard.dirty_objects {
-        let routing_bucket = page_routing_bucket(key, start_routing_bucket, end_routing_bucket);
+    // ONE ITERATION PER DIRTY BUCKET, where this was one per dirty OBJECT.
+    //
+    // The loop this replaces walked every dirty object key and hashed it to recompute a routing
+    // bucket, to add 1 to a per-bucket counter. That is a fold whose group key was known when the
+    // object was marked dirty and thrown away; `DirtyObjectIndex` keeps it, so the fold is
+    // already done. Same arithmetic -- adding 1 N times and adding N are the same number well
+    // below saturation -- over a loop bounded by the bucket count instead of the corpus.
+    //
+    // This function runs three times in one `apply_storage_lifecycle` and again on each metrics
+    // scrape, so the per-key hash was paid four times a round over a set that grows with ingest.
+    for (routing_bucket, dirty_object_count) in shard.dirty_objects.bucket_counts() {
+        DIRTY_SUMMARY_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let summary = buckets.entry(routing_bucket).or_insert(BucketStorageSummary {
             routing_bucket,
             ..BucketStorageSummary::default()
         });
-        summary.dirty_object_count = summary.dirty_object_count.saturating_add(1);
-        summary.dirty_generation = summary.dirty_generation.saturating_add(1);
+        summary.dirty_object_count = summary
+            .dirty_object_count
+            .saturating_add(dirty_object_count);
+        summary.dirty_generation = summary.dirty_generation.saturating_add(dirty_object_count);
     }
     for (routing_bucket, summary) in &mut buckets {
         summary.block_slab_ids = block_slabs_by_bucket

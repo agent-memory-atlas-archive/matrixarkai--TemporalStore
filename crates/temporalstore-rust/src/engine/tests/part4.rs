@@ -4568,7 +4568,7 @@ fn dirty_objects_versus_the_pages_own_dirty_flags() {
         .map(|page| page.object_key.to_string())
         .collect();
 
-    let in_set_not_flagged: Vec<&String> = shard
+    let in_set_not_flagged: Vec<&str> = shard
         .dirty_objects
         .iter()
         .filter(|k| !pages_marked_dirty.contains(*k))
@@ -7704,7 +7704,7 @@ fn per_record_structure_census() {
                 .sum::<usize>()
         })
         .sum();
-    let dirty_bytes: usize = shard.dirty_objects.iter().map(String::len).sum();
+    let dirty_bytes: usize = shard.dirty_objects.iter().map(str::len).sum();
     let total_string_bytes =
         key_bytes + page_index_bytes + page_lookup_bytes + component_lookup_bytes + dirty_bytes;
     let sample_key_len = shard.strings.keys().next().map_or(0, |name| name.len());
@@ -7809,7 +7809,7 @@ fn dirty_bucket_count_matches_the_unshortened_scan() {
         .iter()
         .filter_map(|(bucket_id, bucket)| bucket.dirty.then_some(*bucket_id))
         .collect();
-    for object_key in &shard.dirty_objects {
+    for object_key in shard.dirty_objects.iter() {
         expected.extend(crate::engine::bucket_index_target_buckets_for_object_key(
             shard, object_key,
         ));
@@ -19942,5 +19942,373 @@ budget each round, not restart at the front",
         vec![budget; 3],
         "large arm ({large_total} live pages) read {large_probed:?} pages a round against a \
 budget of {budget}. A bounded probe's cost must not grow with the store.",
+    );
+}
+
+/// WHICH BUCKET a live page is summarised under, when its address does not say.
+///
+/// `bucket_storage_summaries` takes the shard's routing range and used it for the dirty-key loop
+/// only. Its live-page loop fell back to `bucket_for_object(key, 0, u32::MAX)` -- a different
+/// placement from the one `rebuild_bucket_first_index` and the flag refresh use, which is
+/// `page_routing_bucket(key, start, end)`. The two agree only while the shard spans the whole
+/// range, and a production shard does not: `TS_SHARD_END_ROUTING_SLOT=1023` is the setting that
+/// cuts resident memory 45%.
+///
+/// HONEST ABOUT THE DENOMINATOR. On the live write path the fallback never fires -- a probe over
+/// 2 000 records found every entry carrying an explicit routing bucket, so simply writing records
+/// and reading summaries CANNOT fail this, before or after the change. The fixture therefore
+/// strips the routing bucket off every page address, which is the state a page rebuilt from a
+/// source that did not carry one arrives in, and asserts that the strip took effect before it
+/// asserts anything about the answer.
+#[test]
+fn a_page_with_no_routing_bucket_is_summarised_inside_the_shards_own_range() {
+    const RECORDS: usize = 400;
+    const END_ROUTING_BUCKET: u32 = 1023;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("pages"),
+        dir.path().join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "routing-range".to_string(),
+                shard_uri: "local://routing-range/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: END_ROUTING_BUCKET,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("range-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 loaded");
+
+    // DENOMINATOR ONE: the shard holds pages at all.
+    let pages_before: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|bucket| bucket.page_index.len())
+        .sum();
+    assert!(pages_before > 0, "fixture stored no pages, so this measures nothing");
+
+    // Put the pages into the state this branch exists for.
+    for bucket in shard.bucket_index.bucket_map.values_mut() {
+        for page in bucket.page_index.values_mut() {
+            page.address.set_routing_bucket(None);
+        }
+    }
+
+    // DENOMINATOR TWO: the strip took, so the fallback is what answers below. Without this the
+    // test passes on a fixture where the addresses still carry a bucket and the branch under
+    // test never runs -- which is exactly how the live write path behaves.
+    let stripped = crate::engine::storage_bucket_internals::collect_live_page_entries(shard)
+        .iter()
+        .filter(|entry| entry.address.routing_bucket().is_none())
+        .count();
+    assert_eq!(
+        stripped, pages_before,
+        "the fixture meant to leave {pages_before} pages without a routing bucket and left \
+{stripped}; the fallback under test is not the code answering",
+    );
+
+    let bucket_ids: BTreeSet<u32> = shard.bucket_index.bucket_map.keys().copied().collect();
+    let summaries =
+        crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, END_ROUTING_BUCKET);
+
+    // HALF ONE: nothing is filed outside the range the shard was loaded with.
+    let outside_range: Vec<u32> = summaries
+        .iter()
+        .map(|summary| summary.routing_bucket)
+        .filter(|routing_bucket| *routing_bucket > END_ROUTING_BUCKET)
+        .collect();
+    assert!(
+        outside_range.is_empty(),
+        "{} of {} summaries name a bucket above the shard's end ({END_ROUTING_BUCKET}); the \
+first few are {:?}. A summary for a bucket outside the shard's own range belongs to no bucket \
+the index holds.",
+        outside_range.len(),
+        summaries.len(),
+        &outside_range[..outside_range.len().min(5)],
+    );
+
+    // HALF TWO: and the placement agrees with the index, asserted separately -- a run that
+    // stayed inside the range but still disagreed with `bucket_map` would pass the half above.
+    let absent_from_map: Vec<u32> = summaries
+        .iter()
+        .map(|summary| summary.routing_bucket)
+        .filter(|routing_bucket| !bucket_ids.contains(routing_bucket))
+        .collect();
+    assert!(
+        absent_from_map.is_empty(),
+        "{} of {} summaries name a bucket `bucket_map` does not hold; the first few are {:?}. \
+The live-page loop must place a page where `rebuild_bucket_first_index` places it, or a dump \
+naming the real bucket carries none of its pages.",
+        absent_from_map.len(),
+        summaries.len(),
+        &absent_from_map[..absent_from_map.len().min(5)],
+    );
+
+    // And the page count survived the re-placement: every page is still summarised somewhere.
+    let summarised_pages: u64 = summaries.iter().map(|summary| summary.page_ref_count).sum();
+    assert_eq!(
+        summarised_pages, pages_before as u64,
+        "{pages_before} pages went in and {summarised_pages} came out of the summaries",
+    );
+}
+
+/// A shard with `records` string keys, on a 1024-bucket routing range.
+///
+/// 1023 is the end the production setting uses, and it is the shape that makes the difference
+/// between "per dirty object" and "per dirty bucket" visible: with a wide range every key lands
+/// in its own bucket and the two counts are equal, which would make every assertion below hold
+/// for the wrong reason.
+#[cfg(test)]
+fn dirty_index_fixture(dir: &std::path::Path, records: usize) -> TemporalEngine {
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("pages"),
+        dir.join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "dirty-index".to_string(),
+                shard_uri: "local://dirty-index/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: 1023,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("dirty-index-{index:07}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    engine
+}
+
+/// WHAT THE DIRTY HALF OF `bucket_storage_summaries` LOOKS AT, as the store grows.
+///
+/// That half folds the dirty set into a per-bucket count. It used to walk every dirty object key
+/// and hash it to recompute a routing bucket -- a group key that was known at the moment the
+/// object was marked dirty and thrown away. So the fold cost one hash per dirty OBJECT, and the
+/// function runs three times in one `apply_storage_lifecycle` and again on each metrics scrape.
+///
+/// With the bucket recorded alongside the key the fold is already done, and the loop is bounded
+/// by the number of dirty BUCKETS. This counts the visits rather than deriving them, so the
+/// property survives someone rewriting the loop.
+#[test]
+fn the_dirty_half_of_the_summaries_visits_one_entry_per_dirty_bucket() {
+    // 8 000, not less. A 2 000-record arm was tried first and the denominator below REFUSED
+    // it: 2 000 dirty objects across 902 of the 1024 buckets is a ratio of 2.2, at which "one
+    // visit per bucket" and "one visit per object" are nearly the same number and a regression
+    // would sit inside the noise. At 8 000 the ratio is ~7.8. The second point is
+    // `the_dirty_half_at_eighty_thousand`, kept out of the gate for its cost.
+    for records in [8_000usize] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dirty_index_fixture(dir.path(), records);
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+
+        let dirty_objects = shard.dirty_objects.len();
+        let dirty_buckets = shard.dirty_objects.bucket_ids().count();
+
+        // DENOMINATOR ONE: there is a dirty set to fold at all.
+        assert!(
+            dirty_objects > 0,
+            "at {records} records the fixture left nothing dirty, so this measures nothing",
+        );
+        // DENOMINATOR TWO, and the one that matters: the two counts must be FAR APART. If every
+        // dirty object had its own bucket, "one visit per bucket" and "one visit per object"
+        // would be the same assertion and this test could not tell them apart.
+        assert!(
+            dirty_objects >= dirty_buckets.saturating_mul(4),
+            "at {records} records there are {dirty_objects} dirty objects across {dirty_buckets} \
+dirty buckets; the two counts are too close for this test to distinguish per-bucket work from \
+per-object work",
+        );
+
+        crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let summaries =
+            crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, 1023);
+        let visits = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // DENOMINATOR THREE: the half under test ran. A "no more than X" bound holds trivially
+        // at zero, and a summaries call that never reached the dirty loop would read zero.
+        assert!(
+            visits > 0,
+            "the dirty half never ran over {dirty_objects} dirty objects, so the count below \
+measures nothing",
+        );
+        assert_eq!(
+            visits, dirty_buckets as u64,
+            "at {records} records the dirty half looked at {visits} entries for {dirty_buckets} \
+dirty buckets and {dirty_objects} dirty objects. It must be bounded by the bucket count: a \
+number tracking the object count means the per-key hash is back.",
+        );
+
+        // AND THE ANSWER IS UNCHANGED, asserted separately. A fold that visits fewer entries but
+        // reports different totals is not the same fold -- these counts anchor WAL and index
+        // reclaim through the dump manifest's generation fingerprint.
+        let summed: u64 = summaries.iter().map(|s| s.dirty_object_count).sum();
+        assert_eq!(
+            summed, dirty_objects as u64,
+            "at {records} records the summaries account for {summed} dirty objects out of \
+{dirty_objects}",
+        );
+    }
+}
+
+/// The same, at the size a healthy small column has failed to generalise to before.
+///
+///   cargo test --release -p temporalstore-rust --lib the_dirty_half_at_eighty_thousand -- \
+///     --ignored --nocapture
+#[test]
+#[ignore]
+fn the_dirty_half_at_eighty_thousand() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = dirty_index_fixture(dir.path(), 80_000);
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    let dirty_objects = shard.dirty_objects.len();
+    let dirty_buckets = shard.dirty_objects.bucket_ids().count();
+    assert!(dirty_objects > 0, "fixture left nothing dirty");
+    assert!(
+        dirty_objects >= dirty_buckets.saturating_mul(4),
+        "{dirty_objects} dirty objects across {dirty_buckets} buckets is too close to measure",
+    );
+
+    crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let summaries = crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, 1023);
+    let visits = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let summed: u64 = summaries.iter().map(|s| s.dirty_object_count).sum();
+
+    println!(
+        "dirty objects   {dirty_objects}\n\
+         dirty buckets   {dirty_buckets}\n\
+         dirty visits    {visits}\n\
+         summed count    {summed}",
+    );
+    assert!(visits > 0, "the dirty half never ran");
+    assert_eq!(visits, dirty_buckets as u64);
+    assert_eq!(summed, dirty_objects as u64);
+}
+
+/// A PARTIAL DUMP DRAINS THE BUCKETS IT CLEARED, not the whole dirty set.
+///
+/// The drain used to walk every dirty object key and re-hash it to decide whether the key
+/// belonged to a bucket this dump had cleared. So a round dumping ONE bucket paid for the whole
+/// set -- and `max_dump_buckets_per_round` exists precisely so that a round dumps a slice.
+///
+/// The dirty index is keyed by bucket, so the keys to drop are addressable directly. This is the
+/// half that `the_dump_drain_looks_at_each_dirty_object_once` cannot see: that guard dumps EVERY
+/// bucket, where visits == the whole set either way.
+#[test]
+fn a_partial_dump_drains_only_the_buckets_it_cleared() {
+    const RECORDS: usize = 4_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = dirty_index_fixture(dir.path(), RECORDS);
+
+    let (dirty_before, buckets_before, chosen, chosen_share) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let mut counts = shard.dirty_objects.bucket_counts().collect::<Vec<_>>();
+        // The busiest bucket, so the share this dump drops is the LARGEST a single bucket can
+        // offer -- a bound that holds for it holds for any other.
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let (chosen, chosen_share) = counts.first().copied().expect("some bucket is dirty");
+        (
+            shard.dirty_objects.len(),
+            shard.bucket_index.bucket_map.len(),
+            chosen,
+            chosen_share,
+        )
+    };
+
+    // DENOMINATORS: something is dirty, it is spread over many buckets, and the one bucket this
+    // dump names holds a small share of it. Without the last of these "drained only its own
+    // bucket" and "drained everything" are the same number.
+    assert!(dirty_before > 0, "fixture left nothing dirty");
+    assert!(buckets_before > 1, "fixture put everything in one bucket");
+    assert!(
+        chosen_share.saturating_mul(4) < dirty_before as u64,
+        "the busiest bucket holds {chosen_share} of {dirty_before} dirty objects, which is too \
+large a share for this test to tell a partial drain from a full one",
+    );
+
+    crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    engine.apply_storage_lifecycle(StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: vec![chosen],
+        ..Default::default()
+    });
+    let visits = crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // HALF ONE: the drain ran at all. Zero is what a dump that cleared nothing looks like, and
+    // it would satisfy the bound below for the wrong reason.
+    assert!(
+        visits > 0,
+        "the drain never ran over {dirty_before} dirty objects across {buckets_before} buckets, \
+so the bound below measures nothing",
+    );
+    // HALF TWO: and it looked at this bucket's keys only.
+    assert_eq!(
+        visits, chosen_share,
+        "dumping bucket {chosen} alone drained {visits} keys; that bucket holds {chosen_share} \
+of the shard's {dirty_before} dirty objects. A number near {dirty_before} means the drain is \
+walking the whole set again to find one bucket's keys.",
+    );
+
+    // HALF THREE, asserted separately: the right keys went. A drain that visited the right
+    // NUMBER of keys but removed the wrong ones would pass both halves above.
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    assert_eq!(
+        shard.dirty_objects.len() as u64,
+        dirty_before as u64 - chosen_share,
+        "{dirty_before} dirty objects less bucket {chosen}'s {chosen_share} should leave {}",
+        dirty_before as u64 - chosen_share,
+    );
+    assert!(
+        !shard.dirty_objects.bucket_ids().any(|bucket| bucket == chosen),
+        "bucket {chosen} was dumped and cleared but still holds dirty objects",
     );
 }
