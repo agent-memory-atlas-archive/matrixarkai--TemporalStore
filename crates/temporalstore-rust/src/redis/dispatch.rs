@@ -113,16 +113,24 @@ pub fn execute_redis_command_with_state(
                 Err(err) => RespValue::Error(format!("ERR {err}")),
             }
         }
+        // GETSET IS `SET key value GET`, AND CARRIES SET SEMANTICS WITH IT. The caller hands
+        // over the whole new value, so the deadline that belonged to the value being replaced
+        // goes with it. `StringSet` never touches the expiry index -- it drops an already-
+        // lapsed record and then writes the page -- so it left the OLD countdown running under
+        // the NEW value, and the key vanished at a time the caller had overwritten away. The
+        // conditional write is the one that clears the deadline, and it carries the old value
+        // back in the same command, so the separate `StringGet` that used to read it (and
+        // could observe a different record than the one being replaced) is gone too.
         "GETSET" if args.len() == 3 => {
             let key = string_arg(&args[1]);
-            match execute(Command::StringGet { key: key.clone() }) {
+            match execute(Command::StringSetConditional {
+                key: key.clone(),
+                value: args[2].clone(),
+                ttl_ms: None,
+                condition: StringSetCondition::Always,
+                return_old: true,
+            }) {
                 Ok(CommandResponse::Bytes { value }) => {
-                    if let Err(err) = execute(Command::StringSet {
-                        key: key.clone(),
-                        value: args[2].clone(),
-                    }) {
-                        return RespValue::Error(format!("ERR {err}"));
-                    }
                     state.keyspace.insert(key);
                     RespValue::Bulk(value)
                 }
@@ -180,11 +188,16 @@ pub fn execute_redis_command_with_state(
             Ok(_) => RespValue::Error("ERR invalid setnx response".to_string()),
             Err(err) => RespValue::Error(format!("ERR {err}")),
         },
+        // MSET IS A BATCH OF SET, SO EACH PAIR CLEARS ITS OWN DEADLINE. Same rule, same
+        // reason as GETSET above: the caller supplies the whole value for each key.
         "MSET" if args.len() >= 3 && args.len() % 2 == 1 => {
             for pair in args[1..].chunks(2) {
-                if let Err(err) = execute(Command::StringSet {
+                if let Err(err) = execute(Command::StringSetConditional {
                     key: string_arg(&pair[0]),
                     value: pair[1].clone(),
+                    ttl_ms: None,
+                    condition: StringSetCondition::Always,
+                    return_old: false,
                 }) {
                     return RespValue::Error(format!("ERR {err}"));
                 }
@@ -205,10 +218,17 @@ pub fn execute_redis_command_with_state(
                     Err(err) => return RespValue::Error(format!("ERR {err}")),
                 }
             }
+            // The same write as MSET, though MSETNX can never observe the difference: it
+            // only reaches here when NONE of its keys exist, and a key that does not exist
+            // has no deadline to discard. It is spelled the same so a reader does not have
+            // to re-derive that, and so the rule has one spelling rather than two.
             for pair in args[1..].chunks(2) {
-                if let Err(err) = execute(Command::StringSet {
+                if let Err(err) = execute(Command::StringSetConditional {
                     key: string_arg(&pair[0]),
                     value: pair[1].clone(),
+                    ttl_ms: None,
+                    condition: StringSetCondition::Always,
+                    return_old: false,
                 }) {
                     return RespValue::Error(format!("ERR {err}"));
                 }
@@ -238,6 +258,16 @@ pub fn execute_redis_command_with_state(
                                 if let Err(err) = execute(Command::CommonExpire { key, ttl_ms }) {
                                     return RespValue::Error(format!("ERR {err}"));
                                 }
+                            }
+                            // The value was already read above and is still returned; what
+                            // the caller asked for is a key that is gone by the time they
+                            // get it, so it goes now rather than in a millisecond.
+                            GetExDeadline::Discard => {
+                                if let Err(err) = execute(Command::CommonDelete { key: key.clone() })
+                                {
+                                    return RespValue::Error(format!("ERR {err}"));
+                                }
+                                state.keyspace.remove(&key);
                             }
                         }
                     }
@@ -370,10 +400,10 @@ pub fn execute_redis_command_with_state(
         "RENAMENX" if args.len() == 3 => {
             copy_or_rename_key_response(&args[1], &args[2], true, false, state, &mut execute)
         }
-        "EXPIRE" if args.len() == 3 => expire_response(&args, 1000, execute),
-        "PEXPIRE" if args.len() == 3 => expire_response(&args, 1, execute),
-        "EXPIREAT" if args.len() == 3 => expire_at_response(&args, 1000, execute),
-        "PEXPIREAT" if args.len() == 3 => expire_at_response(&args, 1, execute),
+        "EXPIRE" if args.len() == 3 => expire_response(&args, 1000, state, &mut execute),
+        "PEXPIRE" if args.len() == 3 => expire_response(&args, 1, state, &mut execute),
+        "EXPIREAT" if args.len() == 3 => expire_at_response(&args, 1000, state, &mut execute),
+        "PEXPIREAT" if args.len() == 3 => expire_at_response(&args, 1, state, &mut execute),
         "PERSIST" if args.len() == 2 => match execute(Command::CommonPersist {
             key: string_arg(&args[1]),
         }) {
