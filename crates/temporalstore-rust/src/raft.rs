@@ -150,7 +150,8 @@ pub struct RaftSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RaftSnapshotStateImage {
     pub index_bytes: Vec<u8>,
-    pub next_page_id: u64,
+    #[serde(rename = "next_page_id")]
+    pub next_block_id: u64,
     pub slabs: Vec<RaftSnapshotStateImageSlab>,
 }
 

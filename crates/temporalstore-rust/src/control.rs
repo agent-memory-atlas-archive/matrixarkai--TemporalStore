@@ -335,10 +335,10 @@ pub struct ShardStats {
     #[serde(default)]
     pub storage: ShardCanonicalStorageStats,
     pub cache: CacheStats,
-    #[serde(default)]
-    pub page_store: BlockStoreStats,
-    #[serde(default)]
-    pub page_store_zones: BlockStoreSlabSummary,
+    #[serde(default, rename = "page_store")]
+    pub block_store_compat: BlockStoreStats,
+    #[serde(default, rename = "page_store_zones")]
+    pub block_store_slabs_compat: BlockStoreSlabSummary,
     pub block_store: BlockStoreStats,
     #[serde(default)]
     #[serde(alias = "block_store_zones")]
