@@ -15,8 +15,15 @@ adapter -- so the import raised, an ``except`` caught it, and the gauge publishe
 saying "blended scoring" about a deployment running the profile ON is worse than no gauge at all:
 every dashboard reading it describes the opposite of what happened.
 
-So it reads the environment, and the default it falls back to is asserted here against the
-retrieval module's own. Two copies of a default agree until one is edited.
+It now reads the profile by calling the accessor the serving path calls, which lives in
+matrixark_retrieval_effective -- a module with no cycle to enter. The copy of the default this
+file used to pin against the original is gone, and so is the copy of the PARSE that sat beside it
+and was wrong: it read ON only for `1 true yes on` against the serving path's ON-unless-off-word,
+so five values in sixteen published the opposite of what was served.
+
+test_matrixark_the_page_reports_what_a_retrieve_applies carries that value-space check, and the
+one-box page's panels. What is left here is this gauge's own contract: it is emitted, it is
+emitted at its default, and it reaches the scrape.
 """
 from __future__ import annotations
 
@@ -69,20 +76,23 @@ class TheProfileIsPublishedTest(unittest.TestCase):
         self.assertEqual("1", gauge(gwm.onebox_lines(),
                                     "matrixark_gateway_onebox_embedding_first"))
 
-    def test_the_default_here_is_the_default_there(self) -> None:
-        """The duplication this rests on, held to the original.
+    def test_there_is_no_second_copy_of_the_default_to_drift(self) -> None:
+        """This used to pin two copies of the default against each other. There is one now.
 
-        The metrics module cannot import the retrieval module to ask -- that import is circular --
-        so it carries its own copy of the default. Read out of the source rather than imported, for
-        the same reason.
+        The copies were never the problem -- they agreed to the end. The problem was that having
+        two seemed normal, so nothing asked whether the PARSE beside each one agreed too, and it
+        did not. This asserts the condition that made the question possible to forget: that the
+        serving path declares the default and nobody else declares one.
         """
         with io.open(os.path.join(TOOLS, "matrixark_local_adapter_retrieval.py"),
                      encoding="utf-8") as handle:
             source = handle.read()
-        match = re.search(r'ONEBOX_EMBEDDING_FIRST_DEFAULT\s*=\s*"([^"]*)"', source)
-        self.assertIsNotNone(match, "the retrieval module no longer names its default")
-        self.assertEqual(match.group(1), gwm.ONEBOX_PROFILE_DEFAULT,
-                         "the two copies of the one-box default have drifted apart")
+        self.assertIsNone(
+            re.search(r'^ONEBOX_EMBEDDING_FIRST_DEFAULT\s*=\s*"', source, re.M),
+            "the retrieval module declares its own copy of the one-box default again; it should "
+            "import the one in matrixark_retrieval_effective, which is what the gauge reads")
+        import matrixark_retrieval_effective as eff
+        self.assertIs(gwm.ONEBOX_PROFILE_DEFAULT, eff.ONEBOX_EMBEDDING_FIRST_DEFAULT)
 
     def test_the_return_all_state_is_published_too(self) -> None:
         """A dashboard that shows how scoring works without showing whether ranking is allowed to
@@ -98,7 +108,11 @@ class TheProfileIsPublishedTest(unittest.TestCase):
         they do, which is the moment the alert was worth having."""
         os.environ.pop("MATRIXARK_ONEBOX_EMBEDDING_FIRST", None)
         lines = gwm.onebox_lines()
-        self.assertEqual(3, len([l for l in lines if l.startswith("matrixark_gateway_")]))
+        # Four: the profile, whether the profile could be READ, return-all, and its threshold. The
+        # second exists because the first version of this gauge published a plausible 0 for a read
+        # that had failed, and a dashboard cannot tell that apart from a deployment running
+        # blended scoring.
+        self.assertEqual(4, len([l for l in lines if l.startswith("matrixark_gateway_")]))
 
     def test_it_reaches_the_scrape(self) -> None:
         """The positive control: every assertion above passes on a function nothing calls."""

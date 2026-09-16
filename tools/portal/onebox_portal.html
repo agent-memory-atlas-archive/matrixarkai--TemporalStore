@@ -276,6 +276,10 @@
   .savebar .count b{color:var(--warn)}
   .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
   .toolbar input[type=text]{flex:1 1 240px;width:auto}
+  /* A table whose row headers cannot wrap is as wide as its widest header, and without this the
+     page body carries that width: at 375px this page's document scrolled to 579px. The table
+     scrolls inside its own panel instead. */
+  .tablewrap{overflow-x:auto;max-width:100%}
   .inv{width:100%;border-collapse:collapse;font-size:13.5px;margin-bottom:16px}
   .inv th{width:1%;white-space:nowrap;text-align:left;padding:6px 14px 6px 0;font-weight:500;
           color:var(--muted);text-transform:none;letter-spacing:0;font-size:13.5px}
@@ -482,7 +486,9 @@
   <section>
     <h2>The profile</h2>
     <p class="hint" style="margin-top:0">How a candidate is scored. This is the switch that decides
-      what "close to the question" means on this deployment, and it is on by default.</p>
+      what "close to the question" means on this deployment, and it is on by default. Read by
+      running the same resolution a retrieve runs, so it is what applies rather than what is
+      offered.</p>
     <div id="profile"><div class="empty">Enter an admin key to read the configuration.</div></div>
   </section>
 
@@ -507,7 +513,8 @@
   <section>
     <h2>What decides recall</h2>
     <p class="hint" style="margin-top:0">The three caps that bound a retrieve, and which of them was
-      doing the cutting. Raising the others changed nothing in that measurement.</p>
+      doing the cutting. Raising the others changed nothing in that measurement. Each shows the
+      value in force and the build default it fell back to, so an override is visible as one.</p>
     <div id="caps"><div class="empty">Enter an admin key to read the limits.</div></div>
   </section>
 
@@ -676,41 +683,72 @@
     return key ? { Authorization: "Bearer " + key } : {};
   }
 
-  /* The settings this page is about, in the order somebody reads them: what scoring does, then
-     what the scan carries. Named rather than pattern-matched -- a page that guessed which
-     settings were "the one-box ones" would quietly change what it showed when a name changed. */
-  var PROFILE_KEYS = [
-    "retrieval.onebox_embedding_first",
-    "retrieval.project_scan_fields",
-    "retrieval.scan_visits_path"
-  ];
-  var CAP_KEYS = [
-    "retrieval.max_selected_refs",
-    "retrieval.max_global_candidates",
-    "retrieval.top_k_per_layer"
-  ];
-  /* The cap the measurement blamed, so the page can say so beside it rather than in prose
-     somebody has to connect to the row themselves. */
-  var THE_ONE_THAT_CUT = "retrieval.max_selected_refs";
+  /* These two panels used to ask the settings registry which of six named knobs it offered, and
+     render those. That answers "is this configurable here", which is not the question either
+     heading asks -- and the two answers were never the same, the registry's ref cap disagreeing
+     with the served one by up to 156x. When the registry stopped offering the six, both panels
+     said "This build offers none of them." about a profile that was deciding every result and
+     caps that were cutting every retrieve.
 
-  function settingRows(fields, keys, note) {
-    var rows = keys.map(function (key) {
-      var f = fields[key];
-      if (!f) { return ""; }
-      var badge = f.applies === "restart"
-        ? '<span class="badge restart">needs restart</span>' : "";
-      var flag = (note && key === THE_ONE_THAT_CUT)
-        ? '<span class="badge essential">this is the one that cut it</span>' : "";
-      return "<tr><th>" + esc(f.label || key) + badge + flag + "</th><td class='mono'>"
-        + esc(f.value === "" || f.value == null ? f["default"] : f.value)
-        + "</td><td class='mono'>" + esc(f.env || "") + "</td></tr>"
-        + (f.help ? "<tr><td colspan='3' class='hint'>" + esc(String(f.help).split("\n")[0])
-                    + "</td></tr>" : "");
+     /v1/admin/retrieval runs the resolution the serving path runs. A value it could not read
+     comes back as known:false, and is shown as unread rather than as a default. */
+  function unreadable(data, what) {
+    if (data && data.known === false) {
+      return '<div class="msg err">' + esc(data.detail || what) + "</div>";
+    }
+    return "";
+  }
+
+  function renderProfile(data) {
+    var said = unreadable(data, "This deployment could not be asked how it scores a candidate.");
+    if (said) { return said; }
+    var p = (data && data.profile) || {};
+    var dense = !!p.embedding_first;
+    /* The sentence first, then the numbers. Somebody opening this page wants to know which of two
+       things the deployment does; the weights are the evidence, not the answer. */
+    var summary = dense
+      ? "A candidate's score is its vector similarity alone."
+      : "A candidate's score blends vector similarity with a lexical match.";
+    var rows = [
+      ["Scoring", summary],
+      /* Two decimals in both states. Printed raw, the dense case is "1" and "0" while the
+         blended one is "0.72" and "0.28", so one switch formats its two positions differently
+         and the dense case reads as a flag rather than as the weights it is. */
+      ["Vector weight", Number(p.dense_weight).toFixed(2)],
+      ["Lexical weight", Number(p.lexical_weight).toFixed(2)],
+      ["Variable", String(p.env || "")],
+      ["At the build default", p.embedding_first === p.default_is_on ? "yes" : "no — this was set"],
+      ["Scan carries only what it reads", p.scan_projection ? "yes" : "no"]
+    ].map(function (pair) {
+      return "<tr><th>" + esc(pair[0]) + "</th><td class='mono'>" + esc(pair[1]) + "</td></tr>";
     }).join("");
-    return rows
-      ? "<table class='inv'><thead><tr><th>Setting</th><th>Value</th><th>Variable</th></tr></thead>"
-        + "<tbody>" + rows + "</tbody></table>"
-      : '<div class="empty">This build offers none of them.</div>';
+    return "<div class='tablewrap'><table class='inv'><tbody>" + rows
+      + "</tbody></table></div>";
+  }
+
+  function renderCaps(data) {
+    var said = unreadable(data, "This deployment could not be asked what bounds a retrieve.");
+    if (said) { return said; }
+    var caps = (data && data.caps) || [];
+    if (!caps.length) { return '<div class="empty">This build declares no retrieval caps.</div>'; }
+    var rows = caps.map(function (c) {
+      /* An applied value differing from the build default means somebody set it -- which the old
+         registry view could not show at all, because it only ever had the declared number. */
+      /* The neutral badge, not the amber "restart" one. Nothing here needs a restart -- both
+         levels resolve per call -- and an amber badge on a healthy deployment is a small
+         permanent falsehood that teaches the reader to stop seeing amber. */
+      var set = String(c.value) !== String(c.build_default)
+        ? '<span class="badge override">set for this deployment</span>' : "";
+      var flag = c.cuts
+        ? '<span class="badge essential">this is the one that cut it</span>' : "";
+      return "<tr><th>" + esc(c.name) + set + flag + "</th><td class='mono'>" + esc(c.value)
+        + "</td><td class='mono'>" + esc(c.build_default) + "</td><td class='mono'>"
+        + esc(c.env || "") + "</td></tr>"
+        + (c.help ? "<tr><td colspan='4' class='hint'>" + esc(c.help) + "</td></tr>" : "");
+    }).join("");
+    return "<div class='tablewrap'><table class='inv'><thead><tr><th>Cap</th>"
+      + "<th>In force</th><th>Build default</th><th>Variable</th></tr></thead><tbody>"
+      + rows + "</tbody></table></div>";
   }
 
   function renderVectors(store) {
@@ -724,8 +762,8 @@
         + "</td><td class='mono'>" + esc(row.count) + "</td></tr>";
     }).join("");
     var table = rows
-      ? "<table class='inv'><thead><tr><th>Written by</th><th>Width</th><th>Vectors</th></tr>"
-        + "</thead><tbody>" + rows + "</tbody></table>"
+      ? "<div class='tablewrap'><table class='inv'><thead><tr><th>Written by</th>"
+        + "<th>Width</th><th>Vectors</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
       : '<div class="empty">Nothing is encoded in this scope yet.</div>';
     /* The finding, above the table rather than below it: a reader who stops at the first thing
        they see should stop at the one that says the names cannot be right. */
@@ -752,8 +790,8 @@
         + esc(String(k.description || "").split("\n")[0]) + "</td></tr>";
     }).join("");
     return rows
-      ? "<table class='inv'><thead><tr><th>Knob</th><th>Value</th><th>What it does</th></tr>"
-        + "</thead><tbody>" + rows + "</tbody></table>"
+      ? "<div class='tablewrap'><table class='inv'><thead><tr><th>Knob</th><th>Value</th>"
+        + "<th>What it does</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
         + '<div class="hint">Set these under Retrieval settings on the Setup page — per tenant, or '
         + 'per user.</div>'
       : '<div class="empty">This build does not offer them.</div>';
@@ -761,17 +799,14 @@
 
   function load() {
     if (!$("key").value.trim()) { return; }
-    fetch("/v1/admin/config", { headers: auth() })
+    /* One call for both panels, and a small one. This used to pull the whole settings registry
+       to render six rows out of it. */
+    fetch("/v1/admin/retrieval", { headers: auth() })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (d) {
         conn("live", "connected");
-        var fields = {};
-        (d.groups || []).forEach(function (g) {
-          (g.fields || []).forEach(function (f) { fields[f.key] = f; });
-        });
-        if (!Object.keys(fields).length && d.fields) { fields = d.fields; }
-        $("profile").innerHTML = settingRows(fields, PROFILE_KEYS, false);
-        $("caps").innerHTML = settingRows(fields, CAP_KEYS, true);
+        $("profile").innerHTML = renderProfile(d);
+        $("caps").innerHTML = renderCaps(d);
       })
       .catch(function (e) {
         var s = window.__matrixarkConnState(e);

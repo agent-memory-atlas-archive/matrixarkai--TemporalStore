@@ -81,67 +81,35 @@ RETRIEVAL_SCAN_DROPPED_FIELDS = (
     "storage_options",
 )
 
-# OFF by default. A projected record cannot serve the resource and skill scans' lexical, keyword and
-# origin terms, which read `text`; enabling this without hydrating those candidates changes ranking.
-def flag_enabled(name: str, default: str = "0") -> bool:
-    """Read a boolean environment switch.
-
-    Exposed so a test can assert the DEFAULT without reloading this module -- reloading it builds a
-    second module object while the adapter still holds the first one's mixin, which is
-    order-dependent and can break unrelated tests.
-    """
-    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off", ""}
-
-
-# The one-box baseline. It turns on the scan projection AND dense-only scoring together, because
-# each is unsound alone: the projection removes the text the lexical term reads, and dropping the
-# lexical term is what makes removing it safe.
-# ON by default. One-box deployments serve the ranking from the embeddings: scoring is dense-only,
-# which is the half that is measured and safe. Set MATRIXARK_ONEBOX_EMBEDDING_FIRST=0 to serve the
-# hybrid weights instead.
+# The one-box profile and the switch that reads it are DEFINED in matrixark_retrieval_effective,
+# and bound here so every caller that reaches them on this module keeps working -- including the
+# star-importer, which would lose them silently if they were merely dropped.
 #
-# It no longer implies the scan projection -- see retrieval_scan_projection for why that half is
-# still opt-in.
+# They moved because this module cannot be imported from outside. It is a mixin split out of
+# matrixark_mcp_local_adapter and imports back from it, so entering the cycle from a fresh process
+# raises ImportError. Every surface that wanted to report the profile therefore re-derived it, and
+# the derivations disagreed: the gateway metric parsed the same environment variable as
+# `in ("1", "true", "yes", "on")` against this rule's ON-unless-off-word, so a deployment setting
+# `disabled` was served dense-only scoring while the dashboard reported it off.
 #
-# What the default rests on, stated so it can be re-checked rather than assumed: over 269 queries
-# against this repo's own markdown with multilingual-e5-large, the query sentence deleted from its
-# own target so no verbatim span survives, hit@1 moved by -0.011 with a 95% interval of
-# [-0.049, +0.027]. That interval contains zero -- the difference is indistinguishable from none at
-# this sample size, which is not the same as proven absent. It buys 4.11 MB held -> 2.65 MB and 21x
-# less scoring cost.
-ONEBOX_EMBEDDING_FIRST_DEFAULT = "1"
-
-
-def onebox_embedding_first():
-    """Read at call time, never captured at import.
-
-    A module-level constant freezes the flag at whichever moment the module first loaded. Under
-    the full suite that is decided by import order, so the same test passes alone and fails in
-    the suite; in a deployment it means the profile cannot be changed without a restart.
-    """
-    return flag_enabled("MATRIXARK_ONEBOX_EMBEDDING_FIRST", ONEBOX_EMBEDDING_FIRST_DEFAULT)
-
-
-def retrieval_scan_projection():
-    """True when the scan should carry only the fields it reads. OPT-IN, and gated on the profile.
-
-    The profile no longer implies this. The dependency runs one way -- narrowing the row is only
-    safe once the lexical term that reads the text is gone -- and it was written as though it ran
-    both ways.
-
-    Turning the profile on by default showed why that matters. The row the scan carries is the row
-    the pack is built from, so every field the projection drops is a field the answer cannot print.
-    It shipped dropping the text, and retrieval returned "text": "" for every hit. Restoring the
-    obvious four fixed the case in hand and left the rest: entity rows still came back as
-    "memory_feature_profile: memory_feature_profile = " with the value gone. Ten tests across the
-    codex pipeline fail with the projection on and pass with only the scoring change -- measured on
-    the same file: 60 failures with neither, 70 with the projection, 60 with the scoring alone.
-
-    The field list has to be derived from what the serving path actually reads, at runtime, over a
-    corpus that exercises entity and summary assembly -- not extended one failing test at a time.
-    Until then this stays off, and the profile ships the half that is measured and safe.
-    """
-    return onebox_embedding_first() and flag_enabled("MATRIXARK_RETRIEVAL_PROJECT_SCAN_FIELDS")
+# OFF by default for the projection. A projected record cannot serve the resource and skill scans'
+# lexical, keyword and origin terms, which read `text`; enabling it without hydrating those
+# candidates changes ranking. See retrieval_scan_projection there for why that half is still
+# opt-in, and for what the profile default rests on.
+try:  # package path
+    from tools.matrixark_retrieval_effective import (
+        ONEBOX_EMBEDDING_FIRST_DEFAULT,
+        flag_enabled,
+        onebox_embedding_first,
+        retrieval_scan_projection,
+    )
+except ImportError:  # direct execution from tools/
+    from matrixark_retrieval_effective import (  # noqa: F401
+        ONEBOX_EMBEDDING_FIRST_DEFAULT,
+        flag_enabled,
+        onebox_embedding_first,
+        retrieval_scan_projection,
+    )
 
 
 def project_scan_record(record, enabled=None):

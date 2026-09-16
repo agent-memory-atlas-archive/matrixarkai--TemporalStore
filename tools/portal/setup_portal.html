@@ -276,6 +276,10 @@
   .savebar .count b{color:var(--warn)}
   .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
   .toolbar input[type=text]{flex:1 1 240px;width:auto}
+  /* A table whose row headers cannot wrap is as wide as its widest header, and without this the
+     page body carries that width: at 375px this page's document scrolled to 579px. The table
+     scrolls inside its own panel instead. */
+  .tablewrap{overflow-x:auto;max-width:100%}
   .inv{width:100%;border-collapse:collapse;font-size:13.5px;margin-bottom:16px}
   .inv th{width:1%;white-space:nowrap;text-align:left;padding:6px 14px 6px 0;font-weight:500;
           color:var(--muted);text-transform:none;letter-spacing:0;font-size:13.5px}
