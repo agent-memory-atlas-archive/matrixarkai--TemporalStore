@@ -707,7 +707,28 @@ def _portal_offers():
     """
     if "portal_offers" in _CACHE:
         return _CACHE["portal_offers"]
-    offers = _CACHE.setdefault("portal_offers", set())
+    literal = _portal_literal_offers()
+    offers = _CACHE.setdefault("portal_offers", set(literal))
+    offers |= _knob_derived_offers(literal)
+    return offers
+
+
+def _portal_literal_offers():
+    """The half of the page that is WRITTEN OUT: the `env` of each hand-written `Setting(...)`.
+
+    Split from the generated half because the difference decides what retiring a variable COSTS,
+    and the two are indistinguishable once the page is drawn. `_knob_settings` skips a knob whose
+    `env` is empty, so emptying a `Knob.env` takes the generated row away with it and leaves
+    nothing behind -- which is why matrixarkai#1791 could retire three variables and remove no
+    row anybody could still act on. A hand-written row does not go: it keeps its own `env`,
+    `apply_boot` keeps doing `os.environ[name] = value` for it, and once the variable is retired
+    nothing reads what it writes. A row that stores a value, displays it and does nothing is the
+    defect matrixarkai#1793 fixed, and retiring a variable under a hand-written row manufactures
+    it again.
+    """
+    if "portal_literal_offers" in _CACHE:
+        return _CACHE["portal_literal_offers"]
+    offers = _CACHE.setdefault("portal_literal_offers", set())
     try:
         tree = ast.parse(_text("tools/matrixark_gateway_config.py"))
     except SyntaxError:  # pragma: no cover - a broken portal must not widen the surface
@@ -722,21 +743,61 @@ def _portal_offers():
             # for the first caller who unions this set with anything.
             if isinstance(node.args[2].value, str) and node.args[2].value:
                 offers.add(node.args[2].value)
-    offers |= _knob_derived_offers(offers)
     return offers
 
 
-def _internal_knobs():
-    """The knob names matrixark_gateway_config refuses to put on the page."""
-    tree = _tree("tools/matrixark_gateway_config.py")
+def _named_strings(rel, target):
+    """The string members of a module-level `<target> = frozenset({...})`, read out of the syntax.
+
+    Two of matrixark_gateway_config's registers are read this way rather than imported, for the
+    reason `_knob_derived_offers` gives: importing that module resolves the whole registry at
+    import and would make this file's answer depend on import order.
+    """
+    tree = _tree(rel)
     if tree is None:
         return set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 \
-                and getattr(node.targets[0], "id", "") == "INTERNAL_KNOBS":
+                and getattr(node.targets[0], "id", "") == target:
             return {item.value for item in ast.walk(node.value)
                     if isinstance(item, ast.Constant) and isinstance(item.value, str)}
     return set()
+
+
+def _internal_knobs():
+    """The knob names matrixark_gateway_config refuses to put on the page."""
+    return _named_strings("tools/matrixark_gateway_config.py", "INTERNAL_KNOBS")
+
+
+def _badged_read_by_nothing():
+    """The VARIABLES behind `KNOBS_READ_BY_NOTHING`, which is written in knob names.
+
+    Matched by variable, not by knob name, because every other set on this page is a set of
+    variables and the two spellings differ -- `matrixark_gateway_config._unread_envs` records
+    being caught by exactly that once, where a prefix rule marked ten of eleven and left the
+    eleventh looking like a working control.
+    """
+    badged = _named_strings("tools/matrixark_gateway_config.py", "KNOBS_READ_BY_NOTHING")
+    envs = _knob_envs()
+    return {envs[name] for name in badged if name in envs}
+
+
+def _knob_envs():
+    """Every tenant knob's variable, knob name -> env, out of the registry's syntax."""
+    tree = _tree("tools/matrixark_tenant_policy.py")
+    if tree is None:  # pragma: no cover - the policy module is not optional in practice
+        return {}
+    out = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Knob"
+                and len(node.args) >= 3):
+            continue
+        name, env = node.args[0], node.args[2]
+        if not (isinstance(name, ast.Constant) and isinstance(env, ast.Constant)):
+            continue
+        if isinstance(env.value, str) and env.value:
+            out[name.value] = env.value
+    return out
 
 
 def _knob_derived_offers(already):
@@ -1067,6 +1128,61 @@ def path_gating(reads):
                     if key in bound:
                         gating |= bound[key]
     return {name for name in reads if name in gating}
+
+
+#: Everywhere a flag can show a sign of being USED, as against being read. A deployment's own
+#: artefacts, a hand-written document, and the test suite -- the three the retirements below were
+#: derived against. This file is excluded for the reason `_SELF` exists: a file that decides about
+#: names must not count its own mention of them, and every name in `EXAMINED` above would
+#: otherwise hold itself.
+_USING_GLOBS = _SETTING_GLOBS + ("docs/*", "tools/test_*.py")
+
+
+def _named_by_a_using_file():
+    """Every flag name any of those files mentions. 925 of them, against 132 configurable."""
+    if "using" in _CACHE:
+        return _CACHE["using"]
+    names = _CACHE.setdefault("using", set())
+    for rel in _tracked(*_USING_GLOBS):
+        if rel == _SELF:
+            continue
+        names |= set(_NAME.findall(_text(rel)))
+    return names
+
+
+def zero_evidence_configurable(reads):
+    """Configurable knobs with NO sign that anything uses them, which is the retirement lever.
+
+    Nothing a deployment ships assigns one, no document names one, no test names one, no `if`
+    tests one, and the engine does not read one. A knob like that is not obviously retirable --
+    it is the only place worth LOOKING, and matrixarkai#1786 and matrixarkai#1791 between them
+    took fourteen of these and nothing else.
+
+    The rule is deliberately generous about evidence: a test that merely NAMES a variable holds
+    it, without having to set it. Read strictly -- only an assignment counts -- the set is 23
+    rather than 5, and the eighteen in the difference are gateway, retrieval, cross-session and
+    local-mirror controls that ARE used: 13 of them carry a value in the shipped config file, 14
+    are named by a test, and every one is at least one of the two. Generosity here costs a
+    retirement that was never available and buys never proposing one of those.
+
+    WHAT THIS IS NOT. Not a cut list. Being unused in the repository is what makes a knob worth
+    reading, not what decides it: `KNOBS_READ_BY_NOTHING` holds four of the current five for a
+    reason that is about deployments rather than about this tree, and the test below asserts that
+    every one is held by a NAMED mechanism rather than by a sentence.
+
+    VACUITY. The set going empty is the outcome this is for, so a floor on the GROUP would fail
+    on success. The floors belong on the three scans it subtracts, and all three have one:
+    `deployment_configurable` is guarded by the portal and ENV_MAP parse floors in
+    `test_the_configurable_surface_is_the_narrowest_honest_number`, `path_gating` by the named
+    cross-module case in `test_the_toggles_are_reported_apart_from_the_dials`, and
+    `_named_by_a_using_file` by the floor asserted where this is used.
+    """
+    configurable = deployment_configurable(reads)
+    gating = path_gating(reads)
+    named = _named_by_a_using_file()
+    engine = _engine_reads()
+    return {name for name in configurable
+            if name not in gating and name not in named and name not in engine}
 
 
 def deployment_settable(reads):
@@ -1545,15 +1661,30 @@ class TheFlagSurfaceOnlyShrinksTest(unittest.TestCase):
         `env = os.environ; env.get("MATRIXARK_X")` never writes `os.environ` at the read.
 
         Under a hundred is now asserted of the number the phrase always described -- flags a
-        deployment can set that decide whether a path RUNS, which is 54 -- and `configurable` keeps
+        deployment can set that decide whether a path RUNS, which is 55 -- and `configurable` keeps
         its own ceiling, which may only come down. Both are asserted, so nothing that was bounded
         before is unbounded now.
 
-        The 128 are not reducible by the lever that produced the last cut: `configurable and every
-        reader unreachable` is EMPTY, and so is `configurable and read only by tooling`. Every one
-        of the twenty-eight above a hundred is a live control somebody would have to decide to
-        remove, which is a product decision and not a tidy-up. Saying that is the point of leaving
-        the number visible rather than quietly re-scoping it.
+        THE "NOT REDUCIBLE" PARAGRAPH THAT STOOD HERE WAS WRONG, and correcting the number alone
+        would have left the reasoning to rot again. It read: the 128 are not reducible by the
+        lever that produced the last cut -- `configurable and every reader unreachable` is EMPTY,
+        and so is `configurable and read only by tooling` -- therefore every one above a hundred
+        is a live control somebody would have to decide to remove.
+
+        Both measurements were right and the conclusion did not follow. matrixarkai#1786 retired
+        eleven and matrixarkai#1791 three more, 146 -> 132, and none of the fourteen was a live
+        control. The lever was a THIRD one nobody had run: `configurable and NOTHING USES IT` --
+        no shipped artefact assigns it, no document names it, no test names it, no `if` tests it.
+        Two levers having been exhausted is not evidence about a third, and writing it down as
+        though it were is how a page of measurements turns into an argument for stopping.
+
+        So the lever is DERIVED now instead of being argued about, by
+        `zero_evidence_configurable`, and `test_the_zero_evidence_knobs_are_each_held_by_something`
+        says what is left of it: five, four of them held by `KNOBS_READ_BY_NOTHING` -- a decision
+        about deployments that already have a value stored, which nothing a scan of this tree
+        finds can overturn. Under a hundred does not come from here. It comes from deciding to
+        take controls off the operator page, which is the product decision the old paragraph
+        claimed was already the only one left.
         """
         configurable = deployment_configurable(self.reads)
         self.assertLessEqual(
@@ -1576,6 +1707,96 @@ class TheFlagSurfaceOnlyShrinksTest(unittest.TestCase):
             "the surface is %d and the ceiling is %d. Lower it: a ratchet that does not bank a "
             "reduction is the reduction nobody can see was made."
             % (len(configurable), MAXIMUM_CONFIGURABLE))
+
+    def test_the_zero_evidence_knobs_are_each_held_by_something(self) -> None:
+        """What is left of the lever the last two cuts ran, and why each survivor survived.
+
+        `zero_evidence_configurable` is where a retirement comes from, so the interesting question
+        is not how many are left but whether each one is held by a MECHANISM or by a sentence. Two
+        mechanisms hold all five, and both are read out of the tree rather than listed here:
+
+        * `KNOBS_READ_BY_NOTHING` in matrixark_gateway_config, which decides these the other way
+          and says why beside itself -- a deployment may already have one set, and a field that
+          vanishes takes its value out of view while leaving it in the file. Nothing found by
+          scanning this repository can settle that, because it is a fact about deployments.
+        * a HAND-WRITTEN `Setting(...)` row. Emptying a `Knob.env` takes a GENERATED row with it;
+          a hand-written row stays, `apply_boot` keeps writing its variable, and nothing reads
+          what it writes. Retiring the variable under one manufactures the defect matrixarkai#1793
+          fixed, so that retirement is not the name-only change it looks like.
+
+        A knob held by NEITHER is the actionable case: nothing uses it, nothing has decided to
+        keep it, and no row is left behind. The set of those is asserted EMPTY -- so one appearing
+        fails here, with its name, rather than waiting to be re-derived.
+
+        Both holds are matched by VARIABLE, and the badge is written in KNOB names, so the badge
+        can stop holding what it was listed to hold without anything saying so -- rename a knob
+        and its entry silently resolves to nothing. That is checked here rather than assumed.
+        It is the same seam `matrixark_gateway_config._unread_envs` has: it skips a name the
+        registry has lost, which is the safe thing for a badge to do at runtime and the wrong
+        thing for nobody to notice.
+
+        THE GUARDS ARE ON THE SCAN, NOT THE GROUP. This set emptying is what success looks like,
+        so a floor under its size would fail on the day the work finished. What must not go quiet
+        is `_named_by_a_using_file`, and it can break in both directions:
+
+        * TOO NARROW and every configurable knob looks unused. `zero` fills with live controls,
+          the equality below fails loudly, and the floor names the cause instead. Harmless either
+          way -- the failing direction.
+        * TOO WIDE and `zero` EMPTIES, which this check would read as the work being finished. A
+          floor cannot see that; a bigger number passes it. The cause is what is checkable: the
+          scan is too wide exactly when `_USING_GLOBS` starts matching a module that READS flags,
+          because a read is not a use. So the globs are asserted disjoint from
+          `_production_modules()` -- at the cause, where one added glob fails it, rather than at
+          the symptom, where nothing does.
+
+        The SECOND hold can empty the same way, and is guarded the same way. If
+        `_portal_literal_offers` ever widened to the whole page, every GENERATED row would be
+        called hand-written, and a knob that could be retired leaving nothing behind would be
+        reported as held by a row that does not exist. So the split is asserted to still be a
+        split: strictly narrower than the page, with a generated half left in it.
+        """
+        named = _named_by_a_using_file()
+        self.assertGreater(
+            len(named), 300,
+            "only %d flag names are mentioned by a config file, a script, a container, a "
+            "workflow, a document or a test. The evidence scan has stopped matching, and a "
+            "zero-evidence set that empties because the scan broke reads exactly like one that "
+            "emptied because the work was done." % len(named))
+        reading = sorted(set(_tracked(*_USING_GLOBS)) & set(_production_modules()))
+        self.assertEqual(
+            reading, [],
+            "the evidence scan now reads %d production module(s): %s. A module READING a flag is "
+            "not evidence that anything USES it -- with production in scope every configurable "
+            "knob counts as used, the zero-evidence set empties, and the emptying looks like "
+            "progress." % (len(reading), ", ".join(reading)))
+        zero = zero_evidence_configurable(self.reads)
+        badged = _badged_read_by_nothing()
+        literal = _portal_literal_offers()
+        offers = _portal_offers()
+        self.assertTrue(
+            literal < offers and len(offers - literal) > 10,
+            "%d of the %d fields on the page are hand-written and %d are generated from the knob "
+            "registry. The two are no longer being told apart, and that reports a knob whose row "
+            "would VANISH with its variable as one whose row would be left behind -- the hold "
+            "below stops meaning anything and every remaining knob looks unretirable."
+            % (len(literal), len(offers), len(offers - literal)))
+        unheld = sorted(zero - badged - literal)
+        self.assertEqual(
+            unheld, [],
+            "%d configurable knob(s) are used by nothing and held by nothing: %s. Each is a "
+            "name-only retirement nobody has taken -- the variable goes, the tenant-policy route "
+            "stays, and no portal row is orphaned. Take it, or record what holds it where the "
+            "holding mechanism lives." % (len(unheld), ", ".join(unheld)))
+        listed = _named_strings("tools/matrixark_gateway_config.py", "KNOBS_READ_BY_NOTHING")
+        knobs = _knob_envs()
+        lost = sorted(name for name in listed if name not in knobs)
+        self.assertEqual(
+            lost, [],
+            "KNOBS_READ_BY_NOTHING names %d knob(s) the registry does not have a variable for: "
+            "%s. The badge is written in KNOB names and every hold above is matched by VARIABLE, "
+            "so a renamed or removed knob does not fail anything -- it quietly stops holding what "
+            "it was listed to hold. `matrixark_gateway_config._unread_envs` skips a missing name "
+            "for the same reason and the same way." % (len(lost), ", ".join(lost)))
 
     def test_every_container_only_control_is_still_one(self) -> None:
         """Each name in CONTAINER_ONLY_CONTROLS must still have no other surface.
