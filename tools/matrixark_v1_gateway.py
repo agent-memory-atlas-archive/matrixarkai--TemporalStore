@@ -2480,6 +2480,11 @@ ROUTE_DOCS: List[Json] = [
                 "decide what is WRITTEN into the shared store are refused and named in the "
                 "response; at level=tenant they are accepted, because a tenant owns its store.",
      "body": {"level": "user", "user_id": "alice", "settings": {"top_k_per_layer": 24}}},
+    {"group": "Administration", "method": "GET", "path": "/v1/admin/retrieval", "scope": "admin",
+     "summary": "What a retrieve applies on this deployment: how a candidate is scored, and the "
+                "three caps that bound the answer, each with the build default it fell back to. "
+                "Read by running the same resolution the serving path runs, so it reports what "
+                "applies rather than what is configurable. The tenant comes from the key."},
     {"group": "Administration", "method": "GET", "path": "/v1/admin/models", "scope": "admin",
      "summary": "Models to choose from: a curated catalogue, what the configured endpoint says it "
                 "serves, and — for embeddings — what the stored vectors were actually made with. "
@@ -5189,6 +5194,34 @@ def make_v1_app(server: Any, config: Any = None) -> Callable[..., Awaitable[None
                 body["in_store"] = await _embedding_models_in_store(server, cfg, key, tenant,
                                                                    account)
                 body["change_warning"] = _EMBEDDING_CHANGE_WARNING
+            return await _json(send, 200, body)
+
+        # ---- what a retrieve actually applies (auth + admin read) -----------------------------
+        # Read-only, and deliberately not assembled here: matrixark_retrieval_effective holds the
+        # accessors the serving path itself calls, so this route reports by RUNNING the same
+        # resolution rather than by repeating it. Every previous surface that reported on
+        # retrieval re-derived it and each derivation was wrong in its own way.
+        if method == "GET" and path == "/v1/admin/retrieval":
+            allowed, key, tenant, account, key_record = _authorize(scope.get("headers", []), cfg)
+            if not allowed:
+                return await _json(send, 401, {"error": "unauthorized"})
+            denied = _usage_read_denied(key_record)
+            if denied is not None:
+                return await _json(send, 403, denied)
+            try:
+                from matrixark_retrieval_effective import effective_retrieval
+            except Exception as exc:  # pragma: no cover - the accessor module is a leaf
+                # Reported as unreadable rather than filled in with the build defaults. A page
+                # cannot tell a default from a reading, and the caller asked what is APPLIED.
+                return await _json(send, 200, {
+                    "known": False,
+                    "detail": "This deployment could not be asked what a retrieve applies: %s"
+                              % str(exc)[:200],
+                })
+            # The tenant comes from the KEY, never from the request, like every other route here:
+            # a per-tenant override must not be readable by naming somebody else's tenant.
+            body = effective_retrieval(str(tenant or "").strip() or None)
+            body["known"] = True
             return await _json(send, 200, body)
 
         # ---- per-user settings (auth + admin scope) -------------------------------------------

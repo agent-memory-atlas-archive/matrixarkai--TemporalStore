@@ -309,27 +309,22 @@ def _return_all_candidate_threshold(scope) -> int:
 def _tenant_retrieval_limit(name: str, scope: Any, fallback: int) -> int:
     """A retrieval budget: an explicit tenant override, else an explicit env var, else this build.
 
-    Deliberately NOT `resolve()`. That returns the knob registry's default when nobody has set
-    anything, and for these five budgets the registry disagrees with what retrieval actually uses
-    by 10x to 156x -- `max_selected_refs` is 10000 there and 64 here. Wiring to it would read as
-    "the knob works now" while silently multiplying the budget for every deployment that never
-    configured one.
+    Defined in matrixark_retrieval_effective and called through here, so that a surface reporting
+    what a retrieve applies reports it by running this same resolution rather than by re-deriving
+    it. The one-box page used to read these caps from the knob registry, which answers a different
+    question -- whether a knob by that name is offered, not what a retrieve applies -- and the two
+    answers were never the same.
 
-    Both explicit levels are read per call, so a change at either applies with no restart. With
-    nothing set the build default is used exactly as before, so no existing deployment moves.
-
-    Anything unexpected -- no policy module, a non-numeric value, a nonsensical zero -- falls back
-    to the build default: a budget that came out empty would return nothing at all, which is worse
-    than ignoring a bad setting.
+    Still deliberately NOT the registry's `resolve()`. That returns the registry default when
+    nobody has set anything, and for these budgets it disagreed with what retrieval actually uses
+    by up to 156x. Wiring to it would read as "the knob works now" while silently multiplying the
+    budget for every deployment that never configured one.
     """
-    try:
-        from matrixark_tenant_policy import explicit_int
-    except Exception:  # pragma: no cover - policy module absent
-        return fallback
-    try:
-        return explicit_int(name, scope, fallback)
-    except Exception:  # pragma: no cover - a malformed policy must not break retrieval
-        return fallback
+    try:  # package path
+        from tools.matrixark_retrieval_effective import tenant_retrieval_limit
+    except ImportError:  # direct execution from tools/
+        from matrixark_retrieval_effective import tenant_retrieval_limit
+    return tenant_retrieval_limit(name, scope, fallback)
 
 
 

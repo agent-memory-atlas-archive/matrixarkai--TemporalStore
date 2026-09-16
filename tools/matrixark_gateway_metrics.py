@@ -75,6 +75,7 @@ _EXACT_ROUTES = frozenset({
     "/v1/admin/deployment", "/v1/admin/deployment/plan",
     "/v1/admin/api_key_usage", "/v1/admin/ingestion/jobs",
     "/v1/admin/audit",
+    "/v1/admin/retrieval",
 })
 
 
@@ -630,7 +631,13 @@ def worker_count(argv: Optional[List[str]] = None,
 # The retrieval module's own default for the one-box profile. Duplicated here on purpose -- reading
 # it from that module means importing it, which is circular -- and held to the original by a test
 # rather than by hope.
-ONEBOX_PROFILE_DEFAULT = "1"
+# Kept as a name because callers import it, but no longer a second copy of the default: it is the
+# one matrixark_retrieval_effective declares, so the two cannot drift because there is only one.
+try:  # package path
+    from tools.matrixark_retrieval_effective import ONEBOX_EMBEDDING_FIRST_DEFAULT
+except ImportError:  # direct execution from tools/
+    from matrixark_retrieval_effective import ONEBOX_EMBEDDING_FIRST_DEFAULT
+ONEBOX_PROFILE_DEFAULT = ONEBOX_EMBEDDING_FIRST_DEFAULT
 
 
 def onebox_lines() -> List[str]:
@@ -645,16 +652,27 @@ def onebox_lines() -> List[str]:
     is at its default -- a gauge that appears only once somebody changes something cannot be
     alerted on before they do.
     """
-    # Read from the environment, not by importing the retrieval module. Importing it here is a
-    # circular import -- the adapter imports the retrieval mixin and the mixin imports the adapter
-    # -- and the first version of this caught that in an `except` and published 0. A gauge that
-    # says "blended scoring" about a deployment running the profile ON is worse than no gauge:
-    # every dashboard reading it would be describing the opposite of what happened.
+    # Ask the function the serving path asks. This used to parse the environment variable itself,
+    # because importing the retrieval module here is a circular import -- and the first version
+    # caught that in an `except` and published 0, so every dashboard described the opposite of
+    # what was running.
     #
-    # ONEBOX_PROFILE_DEFAULT is the same string the retrieval module defaults to, and
-    # test_matrixark_the_onebox_profile_is_visible asserts the two have not drifted apart.
-    raw = os.environ.get("MATRIXARK_ONEBOX_EMBEDDING_FIRST", ONEBOX_PROFILE_DEFAULT)
-    profile = 1 if str(raw).strip().lower() in ("1", "true", "yes", "on") else 0
+    # The copy that replaced it was wrong in a quieter way. It read ON only for `1 true yes on`,
+    # while the serving path reads ON unless the value is one of `0 false no off ""`. The two
+    # agree on the eight words both list and disagree on everything else, so a deployment setting
+    # `MATRIXARK_ONEBOX_EMBEDDING_FIRST=disabled` was served dense-only scoring while this
+    # reported the profile off -- monitoring agreeing with what the operator meant and
+    # contradicting what the machine did.
+    #
+    # matrixark_retrieval_effective holds the accessor and has no cycle to enter, so there is one
+    # rule again. A failed read is published as a failed read rather than as a plausible 0.
+    profile, profile_readable = 0, 0
+    try:
+        from matrixark_retrieval_effective import onebox_embedding_first
+        profile = 1 if onebox_embedding_first() else 0
+        profile_readable = 1
+    except Exception:  # pragma: no cover - the accessor module is a leaf; this should not happen
+        profile, profile_readable = 0, 0
 
     return_all, threshold = 0, 0
     try:
@@ -672,6 +690,11 @@ def onebox_lines() -> List[str]:
         "similarity alone, 0 when it is blended with a lexical match.",
         "# TYPE matrixark_gateway_onebox_embedding_first gauge",
         "matrixark_gateway_onebox_embedding_first %d" % profile,
+        "# HELP matrixark_gateway_onebox_profile_readable 1 when the profile above was read from "
+        "the function retrieval itself calls, 0 when it could not be read and the gauge above is "
+        "a placeholder rather than a reading.",
+        "# TYPE matrixark_gateway_onebox_profile_readable gauge",
+        "matrixark_gateway_onebox_profile_readable %d" % profile_readable,
         "# HELP matrixark_gateway_return_all_candidates 1 when retrieval returns every candidate "
         "and lets the token budget be the only limit.",
         "# TYPE matrixark_gateway_return_all_candidates gauge",
