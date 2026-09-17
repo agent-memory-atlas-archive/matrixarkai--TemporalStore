@@ -280,6 +280,12 @@
      page body carries that width: at 375px this page's document scrolled to 579px. The table
      scrolls inside its own panel instead. */
   .tablewrap{overflow-x:auto;max-width:100%}
+  /* The table must be allowed to EXCEED the wrapper, or the wrapper has nothing to scroll and the
+     table squeezes instead. `.inv` is width:100%, which a browser treats as preferred and exceeds
+     only as far as minimum content widths force -- and `.inv th` is nowrap while `.inv td` breaks
+     anywhere, so the settled shape is "row header in full, value in a sliver". Measured at 271px
+     before this rule: a 199px header, a 7px value cell, and one row 865px tall. */
+  .tablewrap .inv{min-width:28rem}
   .inv{width:100%;border-collapse:collapse;font-size:13.5px;margin-bottom:16px}
   .inv th{width:1%;white-space:nowrap;text-align:left;padding:6px 14px 6px 0;font-weight:500;
           color:var(--muted);text-transform:none;letter-spacing:0;font-size:13.5px}
@@ -470,8 +476,10 @@
     <span class="conn" role="status" aria-live="polite"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
   </header>
   <p class="lede">What this deployment does when it answers a question, and what each choice
-    costs. Every control here is edited where it lives -- this page gathers them, because the
-    three that decide recall sit on three different surfaces.</p>
+    costs. Read in the order a retrieve asks them: how a candidate is scored, what bounds how many
+    survive, when that bound is set aside, and last what the whole thing is running over. Every
+    control is edited where it lives -- this page gathers them, because the three that decide
+    recall sit on three different surfaces.</p>
 
   <section>
     <div class="sechead"><h2>Access</h2><span class="aux"><label class="check"><input type="checkbox" id="remember"> remember for this browser tab</label></span></div>
@@ -493,6 +501,13 @@
   </section>
 
   <section>
+    <h2>What decides recall</h2>
+    <p class="hint" style="margin-top:0">The three caps that bound a retrieve, and which of them was
+      doing the cutting. Raising the others changed nothing in that measurement. Each shows the
+      value in force and the build default it fell back to, so an override is visible as one.</p>
+    <div id="caps"><div class="empty">Enter an admin key to read the limits.</div></div>
+  </section>
+  <section>
     <h2>Returning everything</h2>
     <p class="hint" style="margin-top:0">A store small enough to fit the answer's budget does not
       need ranking to choose for it. Measured on this build: eighty short facts, one question, an
@@ -510,13 +525,6 @@
     <div id="vectors"><div class="empty">Enter an admin key to read the store.</div></div>
   </section>
 
-  <section>
-    <h2>What decides recall</h2>
-    <p class="hint" style="margin-top:0">The three caps that bound a retrieve, and which of them was
-      doing the cutting. Raising the others changed nothing in that measurement. Each shows the
-      value in force and the build default it fell back to, so an override is visible as one.</p>
-    <div id="caps"><div class="empty">Enter an admin key to read the limits.</div></div>
-  </section>
 
 </main>
 <script>
@@ -692,6 +700,26 @@
 
      /v1/admin/retrieval runs the resolution the serving path runs. A value it could not read
      comes back as known:false, and is shown as unread rather than as a default. */
+  /* Which level supplied a value, in the words both endpoints use. The caps come from
+     /v1/admin/retrieval and the return-all knobs from /v1/admin/policy, and both answer with the
+     same three: a per-user override, a tenant override, the environment variable, or nothing set
+     at all -- which gets no badge, because "the build decided" is the quiet case and a badge on
+     every row is a badge nobody reads.
+
+     The neutral bordered badge, not the amber "restart" one: nothing here needs a restart, both
+     levels resolve per call, and an amber badge on a healthy deployment teaches a reader to stop
+     seeing amber. */
+  var LEVEL = {
+    user: "set for this user",
+    tenant: "set by tenant policy",
+    env: "set by the variable"
+  };
+
+  function levelBadge(source) {
+    return LEVEL[source]
+      ? '<span class="badge override">' + esc(LEVEL[source]) + "</span>" : "";
+  }
+
   function unreadable(data, what) {
     if (data && data.known === false) {
       return '<div class="msg err">' + esc(data.detail || what) + "</div>";
@@ -734,16 +762,27 @@
     var rows = caps.map(function (c) {
       /* An applied value differing from the build default means somebody set it -- which the old
          registry view could not show at all, because it only ever had the declared number. */
-      /* The neutral badge, not the amber "restart" one. Nothing here needs a restart -- both
+      /* WHICH level set it, not merely that something did. A tenant override beats the
+         environment variable, so naming the variable beside a value the variable did not supply
+         sends an operator to change something that will not take effect.
+
+         The neutral badge, not the amber "restart" one: nothing here needs a restart -- both
          levels resolve per call -- and an amber badge on a healthy deployment is a small
          permanent falsehood that teaches the reader to stop seeing amber. */
-      var set = String(c.value) !== String(c.build_default)
-        ? '<span class="badge override">set for this deployment</span>' : "";
+      var set = levelBadge(c.source);
       var flag = c.cuts
         ? '<span class="badge essential">this is the one that cut it</span>' : "";
       return "<tr><th>" + esc(c.name) + set + flag + "</th><td class='mono'>" + esc(c.value)
         + "</td><td class='mono'>" + esc(c.build_default) + "</td><td class='mono'>"
         + esc(c.env || "") + "</td></tr>"
+        /* Said on the row it applies to. A tenant override makes the variable in the last
+           column inert, and a reader who does not know that reads the column as the way to
+           change the number. */
+        + (c.source === "tenant"
+           ? "<tr><td colspan='4' class='hint'>A tenant override supplies this, so "
+             + esc(c.env) + " is not consulted. Change it under Retrieval settings on the Setup "
+             + "page, or clear the override for the variable to apply again.</td></tr>"
+           : "")
         + (c.help ? "<tr><td colspan='4' class='hint'>" + esc(c.help) + "</td></tr>" : "");
     }).join("");
     return "<div class='tablewrap'><table class='inv'><thead><tr><th>Cap</th>"
@@ -785,7 +824,10 @@
       if (!k) { return ""; }
       var inert = k.read_by_nothing
         ? '<span class="badge restart">not read by this build</span>' : "";
-      return "<tr><th>" + esc(name) + inert + "</th><td class='mono'>"
+      /* The endpoint has always sent `source` for every knob and this panel dropped it, so a row
+         read as "this is the value" without saying who set it -- the same thing the cap panel was
+         doing, except here the answer was already on the wire. */
+      return "<tr><th>" + esc(name) + inert + levelBadge(k.source) + "</th><td class='mono'>"
         + esc(k.value == null ? k["default"] : k.value) + "</td><td class='hint'>"
         + esc(String(k.description || "").split("\n")[0]) + "</td></tr>";
     }).join("");

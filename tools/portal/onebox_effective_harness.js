@@ -41,11 +41,18 @@ function extract(marker) {
 const sandbox = {};
 const source = [
   extract("function esc(s)"),
+  /* Both cap and policy rows go through one level map now, so it has to come along or every row
+     throws on an undefined helper. Extracted rather than restated: a harness with its own copy of
+     the labels would agree with itself forever. */
+  extract("var LEVEL = {"),
+  extract("function levelBadge(source)"),
   extract("function unreadable(data, what)"),
   extract("function renderProfile(data)"),
   extract("function renderCaps(data)"),
+  extract("function renderPolicy(knobs)"),
   "sandbox.renderProfile = renderProfile;",
-  "sandbox.renderCaps = renderCaps;"
+  "sandbox.renderCaps = renderCaps;",
+  "sandbox.renderPolicy = renderPolicy;"
 ].join("\n");
 new Function("sandbox", source)(sandbox);
 
@@ -68,6 +75,9 @@ for (const cap of live.caps) {
   ok("cap " + cap.name + " shows the build default (" + cap.build_default + ")",
      caps.indexOf(">" + cap.build_default + "<") >= 0);
   ok("cap " + cap.name + " names its variable", caps.indexOf(cap.env) >= 0);
+  ok("cap " + cap.name + " says which level supplied it",
+     ["tenant", "environment", "default"].indexOf(cap.source) >= 0,
+     "source was " + JSON.stringify(cap.source));
 }
 
 ok("the cap the measurement blamed is marked as such",
@@ -93,25 +103,55 @@ ok("unreadable caps render no table", unreadCaps.indexOf("<table") < 0, unreadCa
 /* ---------- an override is visible as an override ---------- */
 /* The registry view could not show this at all: it only ever held the declared number, so a
    deployment running a cap somebody had set looked identical to one running the default. */
-const overridden = JSON.parse(JSON.stringify(live));
-overridden.caps[0].value = overridden.caps[0].build_default + 7;
-const overriddenOut = sandbox.renderCaps(overridden);
-ok("a cap set for this deployment is marked",
-   /set for this deployment/.test(overriddenOut));
-ok("a cap at its build default is not marked",
-   !/set for this deployment/.test(caps), caps.slice(0, 300));
+/* One payload per level. The badge names WHICH level supplied the value, because a tenant
+   override beats the environment variable: naming the variable beside a value the variable did
+   not supply sends an operator to change something that will not take effect. */
+function atLevel(source) {
+  const copy = JSON.parse(JSON.stringify(live));
+  copy.caps[0].value = copy.caps[0].build_default + 7;
+  copy.caps[0].source = source;
+  return sandbox.renderCaps(copy);
+}
+
+const fromEnv = atLevel("env");
+const fromTenant = atLevel("tenant");
+const overriddenOut = fromEnv;
+
+ok("a cap set by the variable says so", /set by the variable/.test(fromEnv));
+ok("a cap set by tenant policy says so", /set by tenant policy/.test(fromTenant));
+ok("the two levels are not described the same way",
+   !/set by tenant policy/.test(fromEnv) && !/set by the variable/.test(fromTenant));
+
+/* The whole point of separating them. A tenant override makes the variable in the last column
+   inert, and a reader who does not know that reads the column as the way to change the number. */
+ok("a tenant override says the variable is not consulted",
+   /is not consulted/.test(fromTenant), fromTenant.slice(0, 400));
+/* And says WHY, not just that. "MATRIXARK_X is not consulted" tells a reader the variable is
+   being ignored without telling them what is doing the ignoring, so they have no way to find the
+   thing they actually need to change. The first version of this assertion matched only the
+   second half of the sentence, and a mutation deleting the cause survived it. */
+ok("a tenant override names the override as the cause",
+   /tenant override supplies this/.test(fromTenant), fromTenant.slice(0, 400));
+ok("a tenant override names the variable it makes inert",
+   fromTenant.indexOf(live.caps[0].env) >= 0);
+ok("a value from the variable does not say that",
+   !/is not consulted/.test(fromEnv));
+
+ok("a cap at its build default is marked with no level at all",
+   !/set by the variable|set by tenant policy/.test(caps), caps.slice(0, 300));
 
 /* The two columns carry different numbers ONLY when somebody has set one, so this is the only
    payload in which "shows the value in force" and "shows the build default" are distinguishable
    assertions. Against the live payload, where every cap sits at its default, a renderer printing
    the default twice satisfies both -- which is how a mutation that did exactly that survived the
    first mutation run. */
+const setValue = live.caps[0].build_default + 7;
 ok("an overridden cap shows the value IN FORCE, not the default it replaced",
-   overriddenOut.indexOf(">" + overridden.caps[0].value + "<") >= 0,
-   "expected the set value " + overridden.caps[0].value + " in the rendered row");
+   overriddenOut.indexOf(">" + setValue + "<") >= 0,
+   "expected the set value " + setValue + " in the rendered row");
 ok("an overridden cap still shows the default it replaced",
-   overriddenOut.indexOf(">" + overridden.caps[0].build_default + "<") >= 0,
-   "expected the build default " + overridden.caps[0].build_default + " beside it");
+   overriddenOut.indexOf(">" + live.caps[0].build_default + "<") >= 0,
+   "expected the build default " + live.caps[0].build_default + " beside it");
 
 /* ---------- the blended profile renders as blended ---------- */
 const blended = JSON.parse(JSON.stringify(live));
@@ -124,6 +164,33 @@ ok("blended scoring shows both weights",
    blendedOut.indexOf("0.72") >= 0 && blendedOut.indexOf("0.28") >= 0, blendedOut);
 ok("blended scoring is reported as not the default",
    /this was set/.test(blendedOut), blendedOut);
+
+/* ---------- the return-all panel names its level too ---------- */
+/* /v1/admin/policy has always sent `source` for every knob and this panel dropped it, so a row
+   read as "this is the value" without saying who set it -- the same thing the cap panel was doing,
+   except here the answer was already on the wire. */
+const POLICY_KNOBS = {
+  return_all_candidates: { value: true, source: "tenant", description: "Return every candidate." },
+  return_all_candidate_threshold: { value: 80, source: "env", description: "At or below this." }
+};
+const policyOut = sandbox.renderPolicy(POLICY_KNOBS);
+ok("a return-all knob set by tenant policy says so", /set by tenant policy/.test(policyOut));
+ok("a return-all knob set by the variable says so", /set by the variable/.test(policyOut));
+ok("the return-all values still render",
+   policyOut.indexOf("80") >= 0, policyOut.slice(0, 200));
+
+const POLICY_DEFAULTS = {
+  return_all_candidates: { value: false, source: "default", description: "Return every candidate." }
+};
+ok("a return-all knob nobody set carries no level badge",
+   !/set by tenant policy|set by the variable|set for this user/
+      .test(sandbox.renderPolicy(POLICY_DEFAULTS)));
+
+/* One vocabulary across both panels: the same source word must produce the same words on screen,
+   or a reader has to learn two dialects of one idea on one page. */
+const capTenant = atLevel("tenant");
+ok("one source word reads the same in both panels",
+   /set by tenant policy/.test(capTenant) && /set by tenant policy/.test(policyOut));
 
 /* ---------- the positive control ---------- */
 /* Every assertion above is about text appearing in a string. A renderer returning one long string

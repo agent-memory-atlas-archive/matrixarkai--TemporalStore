@@ -28,6 +28,7 @@ rendering a default that looks like a reading.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -270,6 +271,192 @@ class TheEndpointTest(unittest.TestCase):
     def test_exactly_one_cap_is_the_one_that_cuts(self) -> None:
         cuts = [c["name"] for c in eff.effective_retrieval(None)["caps"] if c.get("cuts")]
         self.assertEqual(["max_selected_refs"], cuts)
+
+
+class WhichLevelSuppliedItTest(unittest.TestCase):
+    """A cap names an environment variable, and a tenant override beats that variable.
+
+    Without the level, the page can print `MATRIXARK_MAX_SELECTED_REFS` beside a number that
+    variable did not supply, and an operator sets it, sees nothing change, and has nothing on the
+    page to explain why.
+
+    The page must not work the level out for itself -- that would be a second copy of the
+    precedence, which is the defect this whole change removes. It also cannot be done correctly
+    from outside: see the fall-through case below. So the resolver reports what it chose.
+    """
+
+    KNOB = "max_selected_refs"
+    ENV = "MATRIXARK_MAX_SELECTED_REFS"
+
+    def setUp(self) -> None:
+        self.original = os.environ.get(self.ENV)
+        self.addCleanup(self._restore)
+        os.environ.pop(self.ENV, None)
+
+    def _restore(self) -> None:
+        if self.original is None:
+            os.environ.pop(self.ENV, None)
+        else:
+            os.environ[self.ENV] = self.original
+
+    @staticmethod
+    def _set_policy(tenant, knobs) -> None:
+        """Set the policy on EVERY loaded copy of the module.
+
+        Under `unittest discover` it is imported under two names in one process -- plain and
+        `tools.`-prefixed -- and each copy keeps its own record store. Setting it on the copy this
+        test imported while the resolver's lazy import binds the other makes the override vanish,
+        and the failure reads as "the knob is not wired", which is exactly what it is not.
+        """
+        for module in list(sys.modules.values()):
+            if (getattr(module, "__name__", "").endswith("matrixark_tenant_policy")
+                    and hasattr(module, "set_tenant_policy")):
+                module.set_tenant_policy(tenant, knobs)
+
+    def _cap(self, scope):
+        for cap in eff.effective_retrieval(scope)["caps"]:
+            if cap["name"] == self.KNOB:
+                return cap
+        raise AssertionError("%s is not among the reported caps" % self.KNOB)
+
+    def test_nothing_set_is_reported_as_the_build_default(self) -> None:
+        cap = self._cap("level_none")
+        self.assertEqual("default", cap["source"])
+        self.assertEqual(cap["build_default"], cap["value"])
+
+    def test_the_environment_is_reported_as_the_environment(self) -> None:
+        os.environ[self.ENV] = "77"
+        cap = self._cap("level_env")
+        self.assertEqual(77, cap["value"])
+        self.assertEqual("env", cap["source"])
+
+    def test_a_tenant_override_is_reported_as_the_tenant(self) -> None:
+        self._set_policy("level_tenant", {self.KNOB: 55})
+        cap = self._cap("level_tenant")
+        self.assertEqual(55, cap["value"])
+        self.assertEqual("tenant", cap["source"])
+
+    def test_the_tenant_beats_the_variable_and_the_report_says_so(self) -> None:
+        """The case the page exists to explain. Both are set; only one is in force."""
+        os.environ[self.ENV] = "77"
+        self._set_policy("level_both", {self.KNOB: 55})
+        cap = self._cap("level_both")
+        self.assertEqual(55, cap["value"], "the tenant override did not win")
+        self.assertEqual("tenant", cap["source"],
+                         "the variable is named on the page beside a value it did not supply")
+
+    def test_a_policy_that_names_the_knob_but_supplies_nothing_falls_through(self) -> None:
+        """Why the page cannot work this out for itself.
+
+        A tenant policy carrying a zero for the knob is IGNORED by the resolver -- a budget of
+        nothing returns nothing at all, which is worse than ignoring a bad setting -- so the
+        environment supplies the value. A surface asking "does the policy mention this knob?"
+        would answer "tenant" here and be wrong. Only the resolver knows which level it used.
+        """
+        os.environ[self.ENV] = "77"
+        self._set_policy("level_zero", {self.KNOB: 0})
+        cap = self._cap("level_zero")
+        self.assertEqual(77, cap["value"])
+        self.assertEqual("env", cap["source"],
+                         "a policy that mentions the knob without supplying a usable value is "
+                         "being reported as the level in force")
+
+    def test_both_producers_of_a_level_use_the_same_words(self) -> None:
+        """One page renders levels from two endpoints, so the two must agree on the vocabulary.
+
+        They did not. ``describe_effective_policy`` has always said ``env``; the accessor added for
+        the caps said ``environment``. Nothing broke -- the page simply had two words for one
+        concept, and any renderer showing both had to know both. This pins them together so a
+        third spelling cannot arrive quietly.
+        """
+        import matrixark_tenant_policy as tp
+        policy_words = set()
+        described = tp.describe_effective_policy("vocab_tenant")
+        for knob in (described.get("knobs") or {}).values():
+            if isinstance(knob, dict) and knob.get("source"):
+                policy_words.add(knob["source"])
+        self.assertTrue(policy_words, "the policy description reported no levels at all")
+
+        # Both levels, deliberately. Read with nothing set, every cap answers `default`, and the
+        # assertion below is then true of a one-word set containing the least interesting word --
+        # a mutation reintroducing a second spelling on the ENV branch passed it untouched.
+        cap_words = {cap["source"] for cap in eff.effective_retrieval("vocab_tenant")["caps"]}
+        os.environ[self.ENV] = "77"
+        cap_words |= {cap["source"] for cap in eff.effective_retrieval("vocab_tenant")["caps"]}
+        self._set_policy("vocab_tenant", {self.KNOB: 55})
+        cap_words |= {cap["source"] for cap in eff.effective_retrieval("vocab_tenant")["caps"]}
+        self.assertTrue(cap_words, "the caps reported no levels at all")
+        self.assertGreater(len(cap_words), 1,
+                           "only one level was ever observed (%s), so this compares a vocabulary "
+                           "against itself" % sorted(cap_words))
+
+        # Each side need not use every word -- only words the other side would recognise.
+        known = {"user", "tenant", "env", "default"}
+        self.assertLessEqual(policy_words, known,
+                             "the policy description uses a level word nothing else knows: %s"
+                             % sorted(policy_words - known))
+        self.assertLessEqual(cap_words, known,
+                             "the caps use a level word nothing else knows: %s"
+                             % sorted(cap_words - known))
+
+    def test_the_value_half_is_unchanged(self) -> None:
+        """explicit_int is now the first element of explicit_int_with_source. It must still answer
+        exactly as before for every level, or this refactor moved a serving-path number."""
+        import matrixark_tenant_policy as tp
+        self._set_policy("level_same", {self.KNOB: 55})
+        for scope in ("level_same", "level_none", None):
+            with self.subTest(scope=scope):
+                value, _ = tp.explicit_int_with_source(self.KNOB, scope, 1000)
+                self.assertEqual(tp.explicit_int(self.KNOB, scope, 1000), value)
+
+
+class AWideTableDoesNotWreckThePageTest(unittest.TestCase):
+    """Two rules, both found by measuring the rendered page rather than reading the markup.
+
+    `.inv th` is `white-space: nowrap`, which is right -- a setting name broken across two lines is
+    harder to read than one that runs on -- but it means a table is at least as wide as its widest
+    row header, and without a scroll container the PAGE BODY carries that width. Measured on the
+    shipped page: at a 375px viewport the document scrolled to 579px.
+
+    A wrapper alone does not finish the job, which is the part that had to be measured twice.
+    `.inv` is `width:100%`, and a browser treats that as preferred and exceeds it only as far as
+    minimum content widths force -- `th` is nowrap, `td` breaks anywhere -- so the table settles at
+    "row header in full, value in a sliver" and squeezes instead of scrolling. Measured at a 271px
+    viewport before the second rule: a 199px row header, a **7px** value cell, and one row **865px
+    tall** because its sentence wrapped one character per line. That six-row table rendered 1800px
+    against 333-662px for every other panel on the page.
+
+    The floor is a fixed width rather than `max-content`: max-content tells every cell never to
+    wrap, and one long sentence took the table to **19,888px**. At desktop width the floor is below
+    the panel and does nothing.
+    """
+
+    def setUp(self) -> None:
+        with io.open(os.path.join(PORTAL, "onebox_portal.html"), encoding="utf-8") as handle:
+            self.page = handle.read()
+
+    def test_a_wide_table_scrolls_inside_its_own_panel(self) -> None:
+        self.assertIn(".tablewrap{overflow-x:auto", self.page,
+                      "without this the page body carries the width of its widest table")
+
+    def test_a_wrapped_table_may_exceed_its_wrapper(self) -> None:
+        """Without this the wrapper has nothing to scroll and the table squeezes instead."""
+        self.assertIn(".tablewrap .inv{min-width:", self.page,
+                      "a wrapped table pinned to width:100% collapses its value column to a "
+                      "sliver at narrow widths instead of letting the wrapper scroll")
+
+    def test_the_floor_is_bounded(self) -> None:
+        """`max-content` stops every cell wrapping, which took one table to 19,888px."""
+        self.assertNotIn(".tablewrap .inv{min-width:max-content}", self.page)
+
+    def test_the_panels_that_render_tables_are_wrapped(self) -> None:
+        """The rules above do nothing for a table nobody wrapped."""
+        for renderer in ("renderProfile", "renderCaps", "renderVectors", "renderPolicy"):
+            with self.subTest(renderer=renderer):
+                body = self.page[self.page.index("function %s(" % renderer):]
+                body = body[:body.index("\n  function ")] if "\n  function " in body else body[:4000]
+                self.assertIn("tablewrap", body,
+                              "%s builds a table that nothing wraps" % renderer)
 
 
 class ThePageRendersItTest(unittest.TestCase):
