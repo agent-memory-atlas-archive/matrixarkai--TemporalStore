@@ -50,11 +50,16 @@ const source = [
   extract("function renderProfile(data)"),
   extract("function renderCaps(data)"),
   extract("function subjectLine(data)"),
+  extract("function retrieveCounts(text)"),
+  extract("function workerCount(text)"),
+  extract("function renderAnswering(text)"),
   extract("function renderPolicy(knobs)"),
   "sandbox.renderProfile = renderProfile;",
   "sandbox.renderCaps = renderCaps;",
   "sandbox.renderPolicy = renderPolicy;",
-  "sandbox.subjectLine = subjectLine;"
+  "sandbox.subjectLine = subjectLine;",
+  "sandbox.renderAnswering = renderAnswering;",
+  "sandbox.retrieveCounts = retrieveCounts;"
 ].join("\n");
 new Function("sandbox", source)(sandbox);
 
@@ -231,6 +236,88 @@ ok("and does not claim nobody differs",
 
 ok("an unreadable payload gets no subject line at all",
    sandbox.subjectLine({ known: false, detail: "boom" }) === "");
+
+/* ---------- whether it is answering ---------- */
+/* The panel that would be the whole point of opening this page on a deployment that has stopped
+   retrieving. Under load the gateway sheds: HTTP 200, empty pack, ~100ms -- FASTER than doing the
+   work, so no latency chart shows it. */
+function scrape(served, empty, shed) {
+  return [
+    "# HELP matrixark_gateway_requests_total Requests.",
+    "matrixark_gateway_requests_total{route=\"/v1/retrieve\",method=\"POST\",status=\"200\"} 99",
+    "# TYPE matrixark_gateway_retrieve_outcomes_total counter",
+    'matrixark_gateway_retrieve_outcomes_total{outcome="served"} ' + served,
+    'matrixark_gateway_retrieve_outcomes_total{outcome="empty"} ' + empty,
+    'matrixark_gateway_retrieve_outcomes_total{outcome="shed"} ' + shed
+  ].join("\n");
+}
+
+const counts = sandbox.retrieveCounts(scrape(7, 2, 1));
+ok("the three counters are read out of the scrape",
+   counts.served === 7 && counts.empty === 2 && counts.shed === 1, JSON.stringify(counts));
+
+const healthy = sandbox.renderAnswering(scrape(10, 0, 0));
+ok("a worker answering everything shows the counts", healthy.indexOf(">10<") >= 0, healthy);
+ok("and raises nothing", !/msg err/.test(healthy), healthy);
+
+const shedding = sandbox.renderAnswering(scrape(0, 0, 40));
+ok("a worker that answered nothing says so loudly",
+   /Nothing has been answered/.test(shedding), shedding);
+ok("and the shed count is shown", shedding.indexOf(">40<") >= 0);
+
+const mostly = sandbox.renderAnswering(scrape(3, 5, 4));
+ok("more empty than served is called out",
+   /came back without a pack than with one/.test(mostly), mostly);
+
+/* The one that matters most. Zero of everything is NO EVIDENCE, not health -- reporting "none
+   shed" here would be a clean bill issued about a worker that has answered nothing at all, which
+   is the exact shape of surface this whole effort has been removing. */
+const untouched = sandbox.renderAnswering(scrape(0, 0, 0));
+ok("a worker with no retrieves says there is nothing to report",
+   /nothing to report either way/.test(untouched), untouched);
+ok("and does NOT read as a clean bill of health",
+   !/msg err/.test(untouched) && untouched.indexOf("<table") < 0, untouched);
+
+/* A build that does not emit these must say so rather than have two of three read as zero. */
+const partial = sandbox.renderAnswering(
+  'matrixark_gateway_retrieve_outcomes_total{outcome="served"} 5');
+ok("a partial read is refused rather than completed with zeros",
+   /does not report/.test(partial), partial);
+ok("an empty scrape is refused too",
+   /does not report/.test(sandbox.renderAnswering("")));
+
+ok("the panel says it speaks for one worker",
+   /This worker only/.test(healthy), healthy);
+
+/* Quantified where the scrape allows it. "This worker only" does not tell a reader whether they
+   are looking at most of the traffic or an eighth of it. */
+const fourWorkers = sandbox.renderAnswering(
+  scrape(10, 0, 0) + "\nmatrixark_gateway_workers 4");
+ok("with four workers it says one of four", /one of 4/.test(fourWorkers), fourWorkers);
+
+/* And still does no arithmetic. Four workers do not answer alike, so multiplying one worker's
+   counts by the worker count would invent a deployment-wide total out of one sample -- the exact
+   shape of surface this work has been removing. */
+ok("and still offers no deployment-wide total",
+   /no total is offered/.test(fourWorkers) && fourWorkers.indexOf(">40<") < 0, fourWorkers);
+
+ok("a single-worker deployment is not told it is one of one",
+   !/one of 1/.test(sandbox.renderAnswering(
+     scrape(10, 0, 0) + "\nmatrixark_gateway_workers 1")));
+
+/* A scrape without the worker series still reads correctly -- it just does not quantify. This
+   is NOT testing that null is kept distinct from 1: the sentence only quantifies above one, so
+   those render identically and no assertion here can tell them apart. */
+ok("a scrape without the worker series still reads correctly",
+   /This worker only/.test(healthy) && !/one of/.test(healthy), healthy);
+
+/* It must not be gated on the admin key: /v1/metrics needs none, and this is the one question
+   here worth answering before somebody has found a key. */
+ok("the scrape is fetched outside the key-gated load",
+   /function loadAnswering\(\)/.test(page)
+   && /loadAnswering\(\);/.test(page)
+   && page.indexOf('fetch("/v1/metrics")') >= 0,
+   "the answering panel is behind the admin key");
 
 /* ---------- the positive control ---------- */
 /* Every assertion above is about text appearing in a string. A renderer returning one long string
