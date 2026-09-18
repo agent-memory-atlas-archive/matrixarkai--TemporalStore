@@ -3948,7 +3948,24 @@ ONEBOX_JS = r"""<script>
       return '<div class="msg err"><b>' + esc(f.model) + " at " + esc(f.dim)
         + " dimensions</b><br>" + esc(f.detail) + "</div>";
     }).join("");
-    return bad + table
+    /* Whether the check that is supposed to catch the row above can fire at all.
+
+       A context_model_registry row is the only carrier of model_hash, and the retrieve path
+       compares that hash against the active model before scoring an embedding. An unknown hash is
+       scored anyway -- correct for an older store, and what makes the comparison safe to add. So
+       with vectors present and no registry rows, every hash is unknown and the comparison never
+       rejects anything: the mislabelled vectors above are scored exactly as if they were real.
+
+       Said only when there are vectors and no rows. On a store with rows the machinery is armed
+       and there is nothing to report. */
+    var rows = store.model_registry_rows;
+    var inert = (rows === 0 && (store.total || 0) > 0)
+      ? '<div class="msg err"><b>Nothing records which model produced these vectors.</b> '
+        + "The check that would reject an embedding made by a different encoder compares a model "
+        + "hash that only exists on a registry row, and this scope has none \u2014 so every hash "
+        + "is unknown and nothing is ever rejected.</div>"
+      : "";
+    return bad + inert + table
       + (store.mixed_dimensions
          ? '<div class="hint">This store holds more than one width. Vectors of different widths '
            + 'cannot be compared, so some memories can never match a query.</div>'
@@ -4662,6 +4679,30 @@ MEM0_JS = r"""
     if (ev.target.id === "opRun") { runOp(); }
   });
 
+  /* A 200 is not the same as an answer.
+
+     `search` runs against the retrieve path, which under load returns an empty pack with a
+     backpressure warning in about 100 ms -- so "answered 200 in 104 ms" is what a WORKING search
+     looks like, only faster. The body was on screen and a careful reader could see the empty
+     groups; the sentence a reader takes away said the opposite.
+
+     This reports what the body already says -- an empty `groups`, and the warnings beside it --
+     rather than classifying. The served/empty/shed rule stays in the gateway, where it is
+     measured; a second copy of it in browser JavaScript would be one more rule to drift, and
+     naming the warnings is both simpler and more use than re-deriving a category from them.
+
+     General rather than special-cased to `search`: any answer carrying an empty `groups` gets the
+     sentence, and one that carries no `groups` at all is left alone. */
+  function emptyPackNote(parsed) {
+    if (!parsed || typeof parsed !== "object") { return ""; }
+    if (!Array.isArray(parsed.groups) || parsed.groups.length !== 0) { return ""; }
+    var note = " The pack was empty.";
+    if (Array.isArray(parsed.warnings) && parsed.warnings.length) {
+      note += " Warnings: " + parsed.warnings.join(", ") + ".";
+    }
+    return note;
+  }
+
   function runOp() {
     var op = currentOp;
     if (!$("key").value.trim()) { say($("opMsg"), "Enter an API key first.", "info"); return; }
@@ -4706,10 +4747,11 @@ MEM0_JS = r"""
         var pretty = res.text, parsed = null;
         try { parsed = JSON.parse(res.text); pretty = JSON.stringify(parsed, null, 2); }
         catch (e) { /* leave it raw */ }
+        var nothing = res.ok ? emptyPackNote(parsed) : "";
         say($("opMsg"), res.ok
-          ? op.label + " answered " + res.status + " in " + ms + " ms."
+          ? op.label + " answered " + res.status + " in " + ms + " ms." + nothing
           : op.label + " answered " + res.status + " — " + reason(parsed, res.status),
-          res.ok ? "ok" : "err");
+          res.ok ? (nothing ? "warn" : "ok") : "err");
         var answer = { status: res.status, ms: ms, headers: res.headers,
                        text: pretty, body: parsed };
         renderWire(sent, answer);
