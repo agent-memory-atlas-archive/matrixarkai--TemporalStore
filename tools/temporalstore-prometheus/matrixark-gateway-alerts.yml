@@ -1,10 +1,21 @@
 # Alerts for the customer-facing MatrixArk gateway (`GET /v1/metrics`).
 #
-# The first two are the ones that do not exist anywhere else. Extraction and embedding both fall
-# back to a local deterministic path when they are unconfigured or unreachable; that path answers
-# 200 with rule-extracted memories and hash vectors, so a deployment in that state is
-# indistinguishable from a healthy one on latency, error rate, and every storage metric. Without
-# these rules the failure mode is silent for as long as nobody looks at retrieval quality.
+# Several of these exist because the state they describe is INVISIBLE on latency, error rate and
+# every storage metric -- the deployment answers 200 throughout. Named rather than counted, because
+# a sentence that says "the first two" stops being true the moment somebody inserts a group:
+#
+#   MatrixArkRetrievalNotSemantic, MatrixArkExtractionNotUsingAModel,
+#   MatrixArkSummariesNotUsingAModel
+#       Extraction and embedding both fall back to a local deterministic path when they are
+#       unconfigured or unreachable. That path answers 200 with rule-extracted memories and hash
+#       vectors, so the deployment is indistinguishable from a healthy one until somebody looks at
+#       retrieval quality.
+#
+#   MatrixArkRetrievesAreBeingShed, MatrixArkRetrievesComeBackEmpty
+#       Under load the gateway stops retrieving and answers every retrieve with an empty pack in
+#       ~100 ms. Latency cannot show this: p50 IMPROVES as the packs empty, so the deployment looks
+#       FASTER than one doing the work. The second is the same silence without the backpressure
+#       warning, which does not clear on its own.
 groups:
   - name: matrixark-gateway-stream
     rules:
@@ -22,6 +33,41 @@ groups:
             stream_max_age is the ten-minute rotation and client_gone is a tab closing, so a rule
             over the total would fire on a healthy deployment. The gateway log carries an incident
             token for each one.
+
+  - name: matrixark-gateway-retrieval
+    rules:
+      - alert: MatrixArkRetrievesAreBeingShed
+        expr: >-
+          sum(rate(matrixark_gateway_retrieve_outcomes_total{outcome="shed"}[5m]))
+          / clamp_min(sum(rate(matrixark_gateway_retrieve_outcomes_total[5m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retrieves are being shed, not answered ({{ $labels.instance }})"
+          description: >-
+            Under load this gateway stops retrieving and answers every retrieve with HTTP 200 and
+            an empty pack in about 100 ms, carrying a service_backpressure warning. Latency and
+            error rate cannot show this -- p50 IMPROVES as the packs empty out, so the deployment
+            looks faster than one doing the work. A tenth of retrieves returning nothing is
+            already a product outage. The cooldown lives in gateway state and clears when the
+            load does; a restart clears it too.
+      - alert: MatrixArkRetrievesComeBackEmpty
+        expr: >-
+          sum(rate(matrixark_gateway_retrieve_outcomes_total{outcome="empty"}[15m]))
+          / clamp_min(sum(rate(matrixark_gateway_retrieve_outcomes_total[15m])), 0.001) > 0.25
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A quarter of retrieves return an empty pack with no reason ({{ $labels.instance }})"
+          description: >-
+            These carry no backpressure warning, so they are not shedding: the store is being
+            asked and is answering with nothing. Unlike shedding this does not clear on its own.
+            Check the one-box page (/v1/admin/onebox) for what the store holds and what bounds a
+            retrieve -- an empty pack from a populated store is a known condition on this stack.
+            A low rate is normal: a query genuinely matching nothing lands here too, which is why
+            this is a quarter over half an hour rather than anything tighter.
 
   - name: matrixark-gateway-config
     rules:
