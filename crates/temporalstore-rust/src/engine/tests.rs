@@ -163,3 +163,4 @@ fn bucket_take_arithmetic_with_explicit_clocks() {
     assert!(!allowed);
     assert_eq!(u64::MAX, retry);
 }
+mod page_entry_names;
