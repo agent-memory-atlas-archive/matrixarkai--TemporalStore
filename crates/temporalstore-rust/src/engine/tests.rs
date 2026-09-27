@@ -178,3 +178,4 @@ mod bucket_node_arms;
 mod bucket_flag_masks;
 mod inline_arm_trade;
 mod entry_object_identity;
+mod bucket_tombstone_budget;
