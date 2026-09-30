@@ -2234,8 +2234,9 @@ pub(super) fn reload_released_bucket(
     }
     let mut pages: Vec<(BlockIndex, u64)> = Vec::new();
     // ONE bucket's pages, filtered inside the walk. This used to materialize every live page in
-    // the shard and then drop all but this bucket's, which `reload_all_released_buckets` paid once
-    // per released bucket -- the store multiplied by the batch.
+    // the shard and then drop all but this bucket's -- a batch reload over N released buckets
+    // would have paid the whole store N times. The walk now filters by bucket, so one reload
+    // costs one bucket's pages.
     for entry in collect_model_live_block_entries_in_bucket(shard, routing_bucket) {
         let object_id = entry.address.object_id().unwrap_or_else(|| {
             stable_block_object_id(
@@ -2295,22 +2296,6 @@ pub(super) fn reload_released_bucket(
     shard.bucket_index.released_buckets.remove(&routing_bucket);
     note_bucket_flags_stale(shard, routing_bucket);
     true
-}
-
-/// Reload every released bucket. For the paths that are about to treat the bucket index as a
-/// complete picture and have no single routing bucket to name.
-pub(super) fn reload_all_released_buckets(shard: &mut ShardState, shard_id: ShardId) -> usize {
-    if shard.bucket_index.released_buckets.is_empty() {
-        return 0;
-    }
-    let released: Vec<u32> = shard.bucket_index.released_buckets.iter().copied().collect();
-    let mut reloaded = 0usize;
-    for routing_bucket in released {
-        if reload_released_bucket(shard, shard_id, routing_bucket) {
-            reloaded = reloaded.saturating_add(1);
-        }
-    }
-    reloaded
 }
 
 /// The node-only floor: one `BucketNode` width per resident bucket.
@@ -6030,10 +6015,10 @@ mod release_walk_scale {
 
     /// The same claim for the other half of the pair.
     ///
-    /// `reload_released_bucket` walked the whole shard into owned entries for ONE bucket, and
-    /// `reload_all_released_buckets` calls it once per released bucket -- the store multiplied by
-    /// the batch. The control is inside the assertion: a reload that installed nothing would
-    /// materialize nothing, and the released-page count it is compared against is 1.
+    /// `reload_released_bucket` used to walk the whole shard into owned entries for ONE bucket --
+    /// a batch reload over N released buckets would have paid the store N times. The control is
+    /// inside the assertion: a reload that installed nothing would materialize nothing, and the
+    /// released-page count it is compared against is 1.
     #[test]
     fn reloading_one_bucket_materializes_only_that_buckets_pages() {
         const SMALL: u32 = 500;
