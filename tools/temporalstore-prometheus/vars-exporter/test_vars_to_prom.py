@@ -10,6 +10,9 @@ from unittest import mock
 import vars_to_prom
 
 
+# Supplied metric names are synthetic conversion fixtures for the generic parser,
+# formatter, user-agent, health, and partial-scrape tests. They are not an
+# inventory of metrics emitted by the engine.
 class VarsToPromTest(unittest.TestCase):
     def test_parse_line_sanitizes_metric_and_labels(self):
         parsed = vars_to_prom.parse_line(
@@ -51,21 +54,6 @@ class VarsToPromTest(unittest.TestCase):
 
         self.assertEqual(parsed[0], "__metaserver_raft_peers_1_127_0_0_1:18010_127_0_0_1:18020_0")
         self.assertEqual(parsed[1], 1.0)
-
-    def test_parse_page_store_cache_fallback_metric(self):
-        parsed = vars_to_prom.parse_line(
-            "temporalstore.server.partition.page_store.persistent_read_qps : 3",
-            "nodeserver",
-        )
-
-        self.assertEqual(
-            parsed,
-            (
-                "temporalstore_server_partition_page_store_persistent_read_qps",
-                3.0,
-                'service_role="nodeserver",source="nodeserver"',
-            ),
-        )
 
     def test_scrape_target_uses_curl_user_agent_for_brpc_plain_text(self):
         captured = {}
