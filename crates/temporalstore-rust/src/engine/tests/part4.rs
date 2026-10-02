@@ -2836,11 +2836,18 @@ fn bucket_dump_manifest_rejects_object_lifecycle_mismatch() {
         // through the funnel rather than assuming JSON on either side.
         let mut restored = crate::engine::decode_index_bytes(&reused_owner.index_bytes)
             .expect("manifest index should decode");
+        // THE MISMATCH IS PLANTED IN THE KEY, NOT IN A STORED ID. An object id is derived from
+        // (shard, kind, key), so there is no field on the address to make wrong -- but renaming the
+        // key the manifest's index holds changes the id the install DERIVES for it, which is the
+        // same disagreement this test has always been about, reached through a mechanism that still
+        // exists. Without this the install gate would be tested by planting a value nothing reads.
         let address = restored
             .strings
-            .get_mut("lifecycle")
+            .remove("lifecycle")
             .expect("manifest string address");
-        address.set_object_id(Some(address.object_id().unwrap_or_default().wrapping_add(1)));
+        restored
+            .strings
+            .insert("lifecycle-renamed-to-move-its-derived-id".to_string(), address);
         reused_owner.index_bytes = crate::engine::encode_index_bytes(&restored);
         reused_owner.index_sha256 = sha256_hex_bytes(&reused_owner.index_bytes);
         reused_owner.dump_generation_id = bucket_dump_generation_id(&reused_owner);
@@ -4961,7 +4968,6 @@ fn what_each_address_field_actually_ranges_over() {
             offset = offset.max(a.offset());
             length = length.max(a.length());
             block_id = block_id.max(a.block_id().unwrap_or(0));
-            object_id = object_id.max(a.object_id().unwrap_or(0));
             generation = generation.max(a.generation().unwrap_or(0));
             derived_slab = derived_slab.max(a.slab_id().unwrap_or(0));
         }
@@ -5230,9 +5236,9 @@ fn a_block_whose_address_carries_no_object_id_still_reports_one() {
     {
         let mut shards = engine.shards.write().expect("shards lock poisoned");
         let shard = shards.get_mut(&1).expect("shard 1 loaded");
-        // Deliberately no object id, and no routing slot either.
+        // Deliberately no object id, and no routing slot either -- which is now EVERY address,
+        // since the field is gone. What is under test is that the ENTRY still reports one.
         let address = BlockAddress::from_parts(0, 0, 16, Some(7), None);
-        assert!(address.object_id().is_none(), "the case under test");
         crate::engine::storage_bucket_internals::upsert_bucket_index_block(
             shard,
             1,
@@ -5254,7 +5260,7 @@ fn a_block_whose_address_carries_no_object_id_still_reports_one() {
             }
             seen += 1;
             assert_ne!(
-                page.object_id(),
+                page.object_id(1),
                 0,
                 "a page filed from an address with no object id must still report the computed one"
             );
@@ -5262,7 +5268,7 @@ fn a_block_whose_address_carries_no_object_id_still_reports_one() {
             // the same function and comparing it with itself: the bucket's object index was
             // populated from the id the write path actually used.
             assert!(
-                bucket.object_index.contains(&page.object_id()),
+                bucket.object_index.contains(&page.object_id(1)),
                 "the id the page reports must be the one the write path filed it under"
             );
         }
@@ -8306,7 +8312,7 @@ fn bucket_object_index_already_matches_a_from_scratch_recompute() {
             .block_index
             .values()
             .filter(|page| !page.deleted)
-            .map(|page| page.object_id())
+            .map(|page| page.object_id(1))
             .collect();
         // Mirrors update_bucket_layout: an empty live set over an empty block index leaves the
         // stored set untouched, so only compare where the rebuild would actually assign.
@@ -9228,12 +9234,14 @@ fn a_recorded_outcome_matches_the_index_entry_the_command_produced() {
         .expect("the object it touched must be named");
     assert_eq!(item.kind, "string");
     assert!(!item.deleted);
+    // The item states the id the TERMS derive. It used to be compared against a copy on the
+    // address; the address carries none, so the comparison is against the derivation itself -- which
+    // is not circular here, because `item.object_id` was written by the engine's write path and this
+    // side is computed in the test.
     assert_eq!(
         item.object_id,
-        item.address
-            .as_ref()
-            .and_then(|address| address.object_id())
-            .unwrap_or_default()
+        crate::engine::hashing::stable_block_object_id(1, "string", "outcome-key"),
+        "the outcome states the id the write path derived for the key it names"
     );
 
     // The claim has to equal what the index actually holds. This is the whole point.
@@ -12197,11 +12205,10 @@ fn what_a_live_record_is_made_of() {
         });
     }
 
-    // Does address.object_id() EVER differ from the item's, or go absent? That decides whether it
-    // can be dropped from the wire and rebuilt.
-    let mut same = 0usize;
-    let mut differ = 0usize;
-    let mut absent = 0usize;
+    // THAT QUESTION IS ANSWERED AND ACTED ON. This counted whether `address.object_id()` ever
+    // differed from the item's or went absent, to decide whether it could be dropped from the wire
+    // and rebuilt. It never differed, so it was dropped: an address carries no object id and the
+    // item's own field is the only copy. There is nothing left to count.
     let mut no_address = 0usize;
     for (_, line) in engine
         .write_ahead_log_store()
@@ -12210,15 +12217,12 @@ fn what_a_live_record_is_made_of() {
     {
         let record = crate::wal::decode_wal_line(&line).expect("decodes");
         for item in &record.outcomes {
-            match item.resolved_address().map(|a| a.object_id()) {
-                None => no_address += 1,
-                Some(None) => absent += 1,
-                Some(Some(id)) if id == item.object_id => same += 1,
-                Some(Some(_)) => differ += 1,
+            if item.resolved_address().is_none() {
+                no_address += 1;
             }
         }
     }
-    println!("[census] address object_id: {same} same, {differ} differ, {absent} absent, {no_address} item(s) with no address");
+    println!("[census] {no_address} item(s) with no address; the address carries no object id to compare");
 
     for (_, line) in engine
         .write_ahead_log_store()
@@ -12241,18 +12245,13 @@ fn what_a_live_record_is_made_of() {
             );
             if let Some(address) = item.resolved_address() {
                 println!(
-                    "[census]   address: slab={} off={} len={} block_id={:?} object_id={:?} gen={:?} slab_id={:?}",
+                    "[census]   address: slab={} off={} len={} block_id={:?} gen={:?} slab_id={:?}",
                     address.block_slab_id(),
                     address.offset(),
                     address.length(),
                     address.block_id(),
-                    address.object_id(),
                     address.generation(),
                     address.slab_id(),
-                );
-                println!(
-                    "[census]   item.object_id == address.object_id()? {}",
-                    address.object_id() == Some(item.object_id)
                 );
             }
         }
@@ -13677,7 +13676,7 @@ fn the_maintained_object_index_matches_a_full_rebuild() {
             .block_index
             .values()
             .filter(|page| !page.deleted)
-            .map(|page| page.object_id())
+            .map(|page| page.object_id(1))
             .collect();
         checked += 1;
         live_total += rebuilt.object_count();
@@ -13996,7 +13995,6 @@ fn which_parts_of_a_block_address_are_populated() {
             pages += 1;
             let a = &page.address;
             block_id += usize::from(a.block_id().is_some());
-            object_id += usize::from(a.object_id().is_some());
             generation += usize::from(a.generation().is_some());
             slab_id += usize::from(a.slab_id().is_some());
             compactable += usize::from(a.compact_slab_address().is_some());
@@ -14076,7 +14074,6 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
 
     let mut pages = 0usize;
     let mut routing_matches_bucket = 0usize;
-    let mut object_id_matches_entry = 0usize;
     for (bucket_key, bucket) in shard.bucket_index.bucket_map.iter() {
         for page in bucket.block_index.values() {
             pages += 1;
@@ -14088,9 +14085,10 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
             if block_routing_bucket(&page.object_key, 0, u32::MAX) == *bucket_key {
                 routing_matches_bucket += 1;
             }
-            if page.address.object_id() == Some(page.object_id()) {
-                object_id_matches_entry += 1;
-            }
+            // `object_id_matches_entry` STOOD HERE and has gone with the field. It compared the
+            // id an address CARRIED against the id the entry reports; the entry now derives that id
+            // from its own terms and the address carries none, so both sides would be the same
+            // expression. That is the shape the comment above rejects for the bucket.
         }
     }
     assert!(pages > 0, "the workload must produce pages, or this measures nothing");
@@ -14101,7 +14099,7 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
   {pages} pages
 
     the key's derived bucket == the bucket it is filed in  {routing_matches_bucket:>6}  {:>5.1}%   (0 B, derived)
-    address.object_id        == the entry's own object_id  {object_id_matches_entry:>6}  {:>5.1}%   (8 B)
+    address.object_id        -- RETIRED WITH THE FIELD, not measured as 0 of {pages}
     the digest is no longer held here at all -- it lives in the page envelope,
     which is where a read already verifies against it
 
@@ -14109,7 +14107,6 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
     (the routing bucket is already recovered -- it is not a field any more)
 ",
         pct(routing_matches_bucket),
-        pct(object_id_matches_entry),
         8,
     );
 
@@ -14120,11 +14117,12 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
         "address.routing_slot agrees with its bucket on {routing_matches_bucket} of {pages} pages \
          -- a partial match means some page is filed somewhere its own address does not name"
     );
-    assert!(
-        object_id_matches_entry == 0 || object_id_matches_entry == pages,
-        "address.object_id() agrees with the entry on {object_id_matches_entry} of {pages} pages \
-         -- a partial match means an entry and its address disagree about which object it is"
-    );
+    // THE SECOND ASSERTION IS GONE RATHER THAN LEFT TO PASS. It read
+    // `object_id_matches_entry == 0 || == pages` over a counter whose increment had already been
+    // removed with the field, so it was 0 on every run and the disjunction's first arm made it
+    // unfailable -- while the row above it printed 0.0%, which a reader would take to mean the ids
+    // never agree. They agree by construction now: there is one source for them. An assertion that
+    // cannot fail is indistinguishable from one that passes, so it does not get to stay.
 }
 
 /// Does maintaining the index during a context ingest give the same index as rebuilding it?
@@ -17774,6 +17772,19 @@ fn what_a_message_write_costs_in_bytes_as_history_grows() {
         }
         println!("  {kind:20}  {small:10}  {large:13}   {ratio:6.2}x   {small_held} -> {large_held}");
     }
+    // THIS FLAT CONTROL IS A SINGLE-POINT RATIO AND IT PASSES BY WHERE ITS FILLS FALL.
+    //
+    // A served-index log piece rolls roughly once per 450 appends, costs about 2,100-2,550
+    // allocations, and no row of the per-op ledger mentions it -- so whether the REPS-wide window
+    // at a given fill contains one decides this ratio, and that depends on bytes-per-append. 200
+    // and 1600 are both roll-free on this tree, which is why this reads 1.00x. A change that moves
+    // bytes-per-append moves which fills roll: the sibling
+    // `what_the_string_family_costs_against_the_store` read 1.67x for a change that writes a
+    // SMALLER record, purely because its 3200 sample caught a roll.
+    //
+    // That sibling now samples several large fills, discards any whose window rolled, and refuses
+    // if none survives. This one is left as it is because it is green and reworking a passing test
+    // is not this change's business -- but if it ever moves, look at the roll before the ratio.
     assert!(flat < 1.5, "the flat control reported {flat:.2}x");
     assert!(
         scaling > 3.0,
@@ -17878,7 +17889,7 @@ fn what_a_bigger_read_cache_buys() {
 #[cfg(feature = "alloc-probe")]
 fn what_the_string_family_costs_against_the_store() {
     const REPS: usize = 20;
-    let cost = |kind: &str, fill: usize| -> (u64, u64) {
+    let cost = |kind: &str, fill: usize| -> (u64, u64, bool) {
         let dir = tempfile::tempdir().unwrap();
         let engine = TemporalEngine::with_local_dirs(
             8 * 1024 * 1024,
@@ -17926,6 +17937,23 @@ fn what_the_string_family_costs_against_the_store() {
                 other => panic!("unknown {other}"),
             }
         };
+        // HOW MANY SERVED-INDEX LOG PIECES EXIST, so a roll inside the window can be seen.
+        // A roll costs about 2,100-2,550 allocations and 78-135 KB, once per roughly 450
+        // appends, and no row of the per-op ledger mentions it -- so a twenty-operation window
+        // either contains one or does not, and the ratio below swings by more than the bound.
+        let pieces = |engine: &TemporalEngine| -> usize {
+            let root = engine.index_dir.join("indexlogs");
+            std::fs::read_dir(&root)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name().to_string_lossy().starts_with("shard-1.indexlog")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let pieces_before = pieces(&engine);
         let probe = crate::alloc_probe::Probe::start();
         let mut ok = 0u64;
         for i in 0..REPS {
@@ -17933,11 +17961,11 @@ fn what_the_string_family_costs_against_the_store() {
             assert!(out.status.ok, "{kind} refused: {:?}", out.status);
             ok += 1;
         }
-        (probe.stop().alloc_bytes / REPS as u64, ok)
+        let bytes = probe.stop().alloc_bytes / REPS as u64;
+        (bytes, ok, pieces(&engine) > pieces_before)
     };
 
-    println!("  command          declares?   bytes @200   bytes @3200    ratio");
-    let mut flat = 0.0f64;
+    println!("  command          declares?   bytes @200   bytes @3200    ratio   rolled?");
     let mut scaling = 0.0f64;
     for (kind, declares) in [
         ("SetAdd", "yes"),
@@ -17946,19 +17974,67 @@ fn what_the_string_family_costs_against_the_store() {
         ("StringGet", "n/a"),
         ("StringDelete", "no"),
     ] {
-        let (small, sa) = cost(kind, 200);
-        let (large, la) = cost(kind, 3200);
+        let (small, sa, small_rolled) = cost(kind, 200);
+        let (large, la, large_rolled) = cost(kind, 3200);
         assert!(small > 0, "{kind}: measured zero bytes");
         assert!(sa == REPS as u64 && la == REPS as u64, "{kind}: not every op answered");
         let ratio = large as f64 / small as f64;
-        match kind {
-            "SetAdd" => flat = ratio,
-            "FeatureAppend" => scaling = ratio,
-            _ => {}
+        if kind == "FeatureAppend" {
+            scaling = ratio;
         }
-        println!("  {kind:14}  {declares:9}   {small:10}  {large:12}   {ratio:6.2}x");
+        println!(
+            "  {kind:14}  {declares:9}   {small:10}  {large:12}   {ratio:6.2}x   {}",
+            match (small_rolled, large_rolled) {
+                (false, false) => "no",
+                (true, false) => "at 200",
+                (false, true) => "at 3200",
+                (true, true) => "both",
+            }
+        );
     }
-    assert!(flat < 1.5, "the flat control reported {flat:.2}x");
+
+    // --- THE FLAT CONTROL, SAMPLED RATHER THAN TAKEN AT ONE POINT ---
+    //
+    // The bound stays at 1.5x. What changes is that one sample cannot decide it. A log piece
+    // rolls about once per 450 appends; whether the twenty-operation window at a given fill
+    // contains one depends on bytes-per-append, so two shapes of this engine cross the boundary
+    // at different member counts and a single fill reports a roll for one of them and not the
+    // other. That is how this assertion read 1.67x for a change that writes a SMALLER record.
+    //
+    // So: several large fills, roll-containing samples DISCARDED, and the claim asserted on what
+    // survives. Refusing when nothing survives is the floor -- excluding every sample would hide
+    // the growth this control exists to detect.
+    let (small, _, _) = cost("SetAdd", 200);
+    assert!(small > 0, "the flat control measured zero bytes at the small fill");
+    let mut survivors: Vec<(usize, f64)> = Vec::new();
+    let mut rolled_at: Vec<usize> = Vec::new();
+    for fill in [3200usize, 3400, 3600] {
+        let (large, la, rolled) = cost("SetAdd", fill);
+        assert!(la == REPS as u64, "the flat control did not answer every op at {fill}");
+        let ratio = large as f64 / small as f64;
+        println!(
+            "  flat control @{fill:>5}: {large:>8} B/op against {small} at 200 = {ratio:5.2}x{}",
+            if rolled { "   (a piece ROLLED in this window -- discarded)" } else { "" }
+        );
+        if rolled { rolled_at.push(fill); } else { survivors.push((fill, ratio)); }
+    }
+    assert!(
+        !survivors.is_empty(),
+        "every large sample contained a log-piece roll ({rolled_at:?}), so the flat control has \
+         nothing roll-free to assert on. That is not a pass: a roll in every window means the \
+         period has fallen to the window size and this measurement can no longer separate a \
+         per-operation cost from a periodic one"
+    );
+    let worst = survivors.iter().map(|(_, r)| *r).fold(0.0f64, f64::max);
+    println!(
+        "  flat control: {} roll-free sample(s) of 3, worst {worst:.2}x; rolled at {rolled_at:?}",
+        survivors.len()
+    );
+    assert!(
+        worst < 1.5,
+        "the flat control reported {worst:.2}x on a roll-free window, so this IS growth with the \
+         store and not a log roll landing in the sample: {survivors:?}"
+    );
     assert!(scaling > 3.0, "the scaling control reported {scaling:.2}x -- probe cannot see growth");
     println!("  A string is one page per key, so declaring or not should not matter here.");
 }

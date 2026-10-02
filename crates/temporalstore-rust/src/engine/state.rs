@@ -3618,7 +3618,7 @@ pub(super) struct BlockIndex {
 }
 
 /// One per stored block. TWO shared names, a one-byte model spelling, an address, and three
-/// flags -- 60 bytes of field in 64.
+/// flags -- 52 bytes of field in 56.
 ///
 /// 64, not 72, since the address inside it is 24 bytes and not 32: it shed the `routing_bucket`
 /// the read path now derives from the key, and narrowed its `block_id` to the sixteen bits the
@@ -3641,20 +3641,47 @@ pub(super) struct BlockIndex {
 /// rounding the flags sit in. Packing the three flags would reclaim nothing and would move the
 /// stored index, which spells each one as its own key.
 ///
-/// WHAT DID NOT MOVE IS THE WIRE. The spelling is still written and read as the string it always
-/// was; only the in-memory width changed. `the_stored_spelling_of_a_page_entry_did_not_move` and
-/// `core_index_loads_legacy_bucket_page_field_names` are the guards on that.
-const _: () = assert!(std::mem::size_of::<BlockIndex>() == 64);
+/// AND THE WIRE DID MOVE, IN EXACTLY ONE SLOT. This paragraph said "WHAT DID NOT MOVE IS THE WIRE
+/// -- the spelling is still written and read as the string it always was; only the in-memory width
+/// changed", and named `the_stored_spelling_of_a_page_entry_did_not_move` as its guard. That guard
+/// is what failed on the first suite run after this change, which is how the claim was caught: it
+/// had no wrong word in it and it was no longer true.
+///
+/// `"oi":42` is written `"oi":null` now. `BlockAddressWire::object_id` carries `rename`, `alias`
+/// and `default` but no `skip_serializing_if`, so an address holding no id emits the slot as a null
+/// rather than dropping it. The slot STAYS because the index log packs the address POSITIONALLY --
+/// retiring it would shorten the array and refuse every row already on disk -- and because the
+/// decode still cross-checks an old `g` against `block_id.or(object_id)` through it.
+///
+/// So the stored form moved, `SHARD_INDEX_FORMAT_VERSION` goes to 6 to pay for it, and the guards
+/// are `the_stored_spelling_of_a_page_entry_moved_in_exactly_one_slot` (the four goldens),
+/// `an_index_written_before_this_change_loads_page_for_page_and_writes_back_the_same_bytes` (the
+/// old-row round trip) and `core_index_loads_legacy_bucket_page_field_names` (that the old names
+/// still read).
+const _: () = assert!(std::mem::size_of::<BlockIndex>() == 56);
 
 impl BlockIndex {
-    /// The object this block belongs to.
+    /// The object this block belongs to, DERIVED from the terms rather than read off the address.
     ///
-    /// Held once, in the address, rather than beside it. The entry used to carry its own copy and
-    /// the two agreed on every block -- necessarily, since the field was assigned from the address.
-    /// The write path now puts the computed id into the address, including the fallback used when
-    /// an address arrives without one, so this can always answer.
-    pub(super) fn object_id(&self) -> u64 {
-        self.address.object_id().unwrap_or_default()
+    /// It was `self.address.object_id()` while the address carried one. The address does not any
+    /// more, and this entry holds both remaining terms -- the stored model spelling and the object
+    /// key -- so the only term it lacks is the shard.
+    ///
+    /// THE SHARD IS A PARAMETER AND NOT AN `Option`, deliberately. `ShardState::shard_id` answers
+    /// `None` for a state that never entered the engine, and there is no shard id that is safe to
+    /// guess: a zero here derives a well-formed id belonging to a different shard, which nothing
+    /// downstream can tell from the right one. Taking a definite `ShardId` pushes that decision to
+    /// the caller, where a state IS in scope to ask, and makes the compiler name every site that
+    /// cannot answer.
+    ///
+    /// The component is NOT a term. An object id is per (shard, kind, key); which element of that
+    /// object a block holds is `component`, beside the id and not inside it.
+    pub(super) fn object_id(&self, shard_id: crate::types::ShardId) -> u64 {
+        crate::engine::hashing::stable_block_object_id(
+            shard_id,
+            self.model_id.as_str(),
+            &self.object_key,
+        )
     }
 }
 
@@ -4006,7 +4033,6 @@ fn same_block_address(left: &BlockAddress, right: &BlockAddress) -> bool {
         && left.offset() == right.offset()
         && left.length() == right.length()
         && left.block_id() == right.block_id()
-        && left.object_id() == right.object_id()
     // `routing_bucket` is not compared, because an address no longer holds one. It was the same
     // kind of clause `generation` is: a block's copy of a value the container decides. Two blocks
     // in ONE bucket cannot differ on the bucket, and two blocks in different buckets differ on the
