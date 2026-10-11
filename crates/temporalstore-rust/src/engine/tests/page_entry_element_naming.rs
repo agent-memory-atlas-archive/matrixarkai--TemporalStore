@@ -719,9 +719,13 @@ fn the_entry_without_a_component_is_forty_and_the_stride_forty_eight() {
 ///    `component` as an `Option` with `#[serde(default)]`, so an absent component is not a
 ///    corruption -- it is a shape the decoder is specified to accept. Read off the real serde impls
 ///    rather than off the attributes.
-/// B. THE FOLD FILES IT. `fold_delta_block_items` copies `item.component` straight onto the page
-///    entry, so an item that named nothing produces an index entry that names nothing. This is the
-///    real fold, in the real order the load path runs it.
+/// B. THE FOLD FILES THE PAGE. This said `fold_delta_block_items` copies `item.component`
+///    straight onto the page entry, so an item that named nothing produced an entry that named
+///    nothing. NEITHER the entry nor the item has that field any more, so what the fold files is
+///    an entry naming no element BY CONSTRUCTION rather than by copying an absent name. The leg
+///    still builds the state leg C is about -- it is the real fold, in the real order the load
+///    path runs it -- and the arm picks its planted page out by ADDRESS, which is stricter than
+///    the absence of a name ever was.
 /// C. THE DERIVE IS WHERE IT BECOMES A FIELD. Both arms, over one index holding both states at once.
 ///
 /// # TWO KEYS, BECAUSE ONE KEY CANNOT TELL THE TWO STATES APART DETERMINISTICALLY
@@ -801,12 +805,38 @@ fn a_hash_page_naming_no_field_is_skipped_while_a_genuine_empty_field_name_is_ke
     let _ = &decoded;
 
     // And the delta item, whose EVERY field carries `#[serde(default)]` by stated design, so the
-    // emptiest legal record decodes to an item that names nothing.
+    // emptiest legal record still decodes.
+    //
+    // RESTATED ONTO WHAT CAN STILL BE ASKED, AND DELIBERATELY NOT ONTO THE COUNTER. This asserted
+    // `bare_item.component.is_none()`, and `IndexItem` has no such field -- the claim became
+    // unwritable rather than false. The decoder still READS slot 5, and a name found there is
+    // dropped and COUNTED, by `index_log::stored_element_names_dropped`. This arm does not assert
+    // on that count: it is process-global, and a process-global counter cannot be attributed
+    // across concurrent `#[test]`s -- a mutex does not fix it, which this tree has measured once
+    // already.
+    //
+    // What IS race-free is that neither wire shape is refused, which is leg A's actual claim, and
+    // that a row carrying a name decodes to a WELL-FORMED item rather than to something plausible
+    // and wrong. Both are asserted, because "it decoded" alone would be satisfied by garbage.
     let bare_item: crate::index_log::IndexItem =
         serde_json::from_str("{}").expect("an all-default delta item decodes");
+    let named_item: crate::index_log::IndexItem = serde_json::from_str(
+        r#"{"c":"f0","rb":8539,"ok":"ef-nameless","mi":"hash","d":true}"#,
+    )
+    .expect("a delta row that carries an element name must still decode");
     assert!(
-        bare_item.component.is_none(),
-        "a delta item with no component key decoded with one"
+        !bare_item.deleted && bare_item.entry.is_none(),
+        "the all-default item decoded to something other than all-defaults"
+    );
+    assert_eq!(
+        (8539, "ef-nameless", true),
+        (
+            named_item.routing_bucket,
+            named_item.object_key.as_ref(),
+            named_item.deleted
+        ),
+        "a row carrying an element name decoded with its OTHER slots wrong, so the name is not \
+         merely being dropped -- it is shifting the row"
     );
     println!(
         "[leg A] an absent component is a legal wire shape on both carriers: page entry {} B with \
@@ -916,8 +946,10 @@ fn a_hash_page_naming_no_field_is_skipped_while_a_genuine_empty_field_name_is_ke
         ),
         object_key: nameless_key.into(),
         model_id: "hash".to_string(),
-        // THE WHOLE POINT: this item names no field.
-        component: None,
+        // THE WHOLE POINT USED TO BE THIS FIELD, AND IT IS NOW THE TYPE. The literal stated
+        // `component: None` under the note "this item names no field"; the row has no such field,
+        // so naming no field is what every item is, by construction rather than by choice. The arm
+        // picks this planted page out by ADDRESS, which is what still distinguishes it.
         object_id: stable_block_object_id(1, "hash", nameless_key),
         // THIS FIXTURE USED TO DISAGREE WITH ITS OWN ADDRESS. `from_compact_slab_address`
         // passes `None` for the block id, so the derivation is `in_log = true` and the literal
@@ -1192,5 +1224,183 @@ fn hash_entries_of(engine: &TemporalEngine, key: &str) -> Vec<(String, Vec<u8>)>
     ) {
         crate::types::CommandResponse::HashEntries { entries } => entries,
         other => panic!("HashGetAll answered {other:?}"),
+    }
+}
+
+/// THE STORED PAGE HANDLE DECIDES NOTHING THE FOLD FILES, SO CHANGING ITS DERIVATION IS INERT.
+///
+/// # THE CLAIM THIS EXISTS TO STOP BEING A CITATION
+///
+/// `IndexItem::block_ref_key` is built by `index_log::block_ref_key_from_parts`, whose THIRD term
+/// is the element name: `kind:object_key:component:slab:offset:length:block_id:generation`.
+///
+/// TWO ROUTES FILL THAT TERM, AND THEY USED TO DISAGREE. `engine::collect_upsert_index_items`
+/// passed the element's own name through; the entry walk in `collect_command_index_items_for`
+/// takes the entry's own key from `state::block_index_written_key`, which passes `None` because
+/// the page entry has no element name left to give it. So one physical page was described by two
+/// different handle spellings depending on which emitter produced the row.
+///
+/// THEY AGREE NOW -- both pass `None` -- AND THIS GUARD IS WHAT MADE CONVERGING THEM SAFE.
+/// Converging them changes the handle every upsert row stores and every stored row rebuilds, and
+/// that is inert only because nothing reads the handle back. Before this guard existed that was a
+/// sentence in a doc comment: `strip_block_ref_key_repeat`'s documentation rests the whole
+/// omit-and-rebuild scheme on it -- "find WHO READS THE RECONSTRUCTION first" -- and records that
+/// it once got the consequence backwards. A claim load-bearing enough to be corrected in place is
+/// load-bearing enough to be driven.
+///
+/// IT IS NOT RETIRED WITH THE DISAGREEMENT IT LICENSED. The property it states -- that a stored
+/// handle decides nothing -- is what keeps the omit-and-rebuild scheme honest for a later change
+/// to any of the eight terms. And the named arm below is now a spelling NO writer produces, which
+/// makes it a better negative arm than it was while something still wrote it.
+///
+/// # WHY THE FOLD IS THE RIGHT SUBJECT AND THE ONLY ONE
+///
+/// `fold_delta_block_items` is the only thing in the crate that turns index-log items into page
+/// entries, and `BucketNode::insert_page` computes the map's key with `block_index_handle`, from
+/// the page's OWN fields. So the stored handle has no route into the index by construction -- and
+/// a property that holds by construction is exactly the kind that a later change breaks without
+/// anything failing.
+///
+/// # THE THREE ARMS, AND WHY NONSENSE IS ONE OF THEM
+///
+/// Two arms would show only that the two spellings agree, which is a weaker claim than that the
+/// handle is unread: a fold that happened to parse either spelling into the same thing would pass.
+/// The third arm is a string that is no derivation of anything, so the only way all three can file
+/// the same entry is if none of them is consulted.
+///
+/// rust-internal: drives the engine's own fold over its own index, no external surface
+#[test]
+fn the_stored_page_handle_decides_nothing_the_fold_files() {
+    use crate::engine::hashing::{block_routing_bucket, stable_block_object_id};
+    use crate::engine::state::CoreIndex;
+    use std::collections::BTreeSet;
+
+    let kind = "hash";
+    let object_key = "handle-unread";
+    // ONLY A HANDLE TERM NOW. The row itself cannot carry an element name, so this varies the one
+    // place a name can still appear -- the third term of the handle derivation -- which is exactly
+    // the term under test.
+    let component = "f0";
+    let address = ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+    let routing_bucket = block_routing_bucket(object_key, 0, OPERATOR_END);
+    let object_id = stable_block_object_id(1, kind, object_key);
+
+    let authority = |named: Option<&str>| {
+        crate::index_log::block_ref_key_from_parts(
+            kind,
+            object_key,
+            named,
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            address.block_id().unwrap_or_default(),
+            address.generation().unwrap_or_default(),
+        )
+    };
+    let named = authority(Some(component));
+    let unnamed = authority(None);
+    let nonsense = "not-a-derivation-of-anything".to_string();
+
+    // THE PLANT IS REAL. Without these the arms below could be three spellings of one string, and
+    // the guard would read as a tree fact while asserting only its own fixture.
+    assert_ne!(
+        named, unnamed,
+        "the named and unnamed spellings are the same string, so this fixture does not vary the \
+         term under test"
+    );
+    assert_ne!(named, nonsense, "the nonsense arm is the authority's own output");
+    assert_ne!(unnamed, nonsense, "the nonsense arm is the authority's own output");
+    assert!(
+        named.contains(&format!(":{component}:")),
+        "the named spelling must actually carry the element name, got {named:?}"
+    );
+    assert!(
+        !unnamed.contains(&format!(":{component}:")),
+        "the unnamed spelling must not carry the element name, got {unnamed:?}"
+    );
+
+    // What the fold FILED, including the handle the map ALLOCATED -- which is the sharper half of
+    // the claim: the key an entry is filed under is computed from the page, not read off the row.
+    let census = |handle: &str| -> Vec<(u32, String, String, u64, u64, u64, bool, u64)> {
+        let item = crate::index_log::IndexItem {
+            kind: crate::index_log::IndexItemKind::Page,
+            routing_bucket,
+            block_ref_key: handle.to_string(),
+            object_key: object_key.into(),
+            model_id: kind.to_string(),
+            object_id,
+            entry: Some(address.clone()),
+            deleted: false,
+        };
+        let mut index = CoreIndex::default();
+        // `upsert: false` with no covered keys, so the fold ADDS and removes nothing.
+        crate::engine::fold_delta_block_items(
+            &mut index,
+            &BTreeSet::new(),
+            std::slice::from_ref(&item),
+            false,
+        );
+        let mut rows = Vec::new();
+        for bucket in index.bucket_map.values() {
+            for (allocated, page) in bucket.block_index.iter() {
+                rows.push((
+                    page.routing_bucket,
+                    page.model_id.as_str().to_string(),
+                    page.object_key.as_ref().to_string(),
+                    page.address.block_slab_id(),
+                    page.address.offset(),
+                    page.address.length(),
+                    page.deleted,
+                    *allocated,
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    };
+
+    let from_named = census(&named);
+    let from_unnamed = census(&unnamed);
+    let from_nonsense = census(&nonsense);
+
+    println!("[handle] named    {named:?}");
+    println!("[handle] unnamed  {unnamed:?}");
+    println!("[handle] nonsense {nonsense:?}");
+    println!("[handle] named arm filed:    {from_named:?}");
+    println!("[handle] unnamed arm filed:  {from_unnamed:?}");
+    println!("[handle] nonsense arm filed: {from_nonsense:?}");
+
+    // THE SUBJECT COMES FIRST, AND THE ORDER IS DELIBERATE.
+    //
+    // The floor below is what stops three empty vectors comparing equal. But if the floor ran
+    // first, a mutation that makes the fold CONSULT the handle would redden the floor -- "the fold
+    // did not run" -- which is a true statement about the wrong thing. Asserting the equality
+    // first makes such a mutation fail here, naming the arm whose handle was rejected. A fold that
+    // files nothing at all still cannot pass: the equalities hold vacuously and the floor catches
+    // it two lines down.
+    assert_eq!(
+        from_named, from_unnamed,
+        "dropping the element name from the STORED handle changed what the fold filed, so the \
+         handle IS read back and converging the two derivations is not inert"
+    );
+    assert_eq!(
+        from_named, from_nonsense,
+        "a stored handle that is no derivation of anything changed what the fold filed, so the \
+         fold consults it"
+    );
+
+    // ANTI-VACUITY. Three empty censuses are equal to each other.
+    for (label, rows) in [
+        ("named", &from_named),
+        ("unnamed", &from_unnamed),
+        ("nonsense", &from_nonsense),
+    ] {
+        assert_eq!(
+            1,
+            rows.len(),
+            "the {label}-handle arm filed {} page(s), not the one this guard is about -- the fold \
+             filed nothing, so the equalities above were over empty censuses",
+            rows.len()
+        );
     }
 }
