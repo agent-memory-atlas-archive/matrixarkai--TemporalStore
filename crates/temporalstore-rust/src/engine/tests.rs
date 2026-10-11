@@ -35,6 +35,130 @@ use crate::{ElementEntry, BlockStoreOptions, BlockStore};
 
 
 
+/// THE OBJECT OF EVERY PAGE IN ONE INDEX, KEYED BY THE POSITION THE PAGE IS FILED AT.
+///
+/// # WHY THIS AND NOT ONLY [`pages_with_identity`]
+///
+/// Half the walks that have to be converted cannot give up their own nesting. They need the
+/// BUCKET as well as the page -- to read a tombstone row out of it, to count its object index, to
+/// `retain` over it -- and a flat list of pages does not carry the bucket. This composes with
+/// whatever walk is already there: take it once, then ask it per page.
+///
+/// IT OWNS ITS KEYS AND BORROWS NOTHING, which is what lets a `retain` use it. `retain` holds the
+/// bucket map mutably and the keys are drawn from a SIBLING field of the same index, so a map that
+/// borrowed would be refused; the `Arc` clones cost one refcount bump each and the borrow ends
+/// when this returns.
+pub(super) struct PageObjects {
+    by_position: std::collections::HashMap<(u32, u64), std::sync::Arc<str>>,
+}
+
+impl PageObjects {
+    /// Taken in ONE pass over the index, from the same two sources [`pages_with_identity`] reads.
+    pub(super) fn of(index: &crate::engine::state::CoreIndex) -> Self {
+        Self {
+            by_position: pages_with_identity(index)
+                .into_iter()
+                .map(|(routing_bucket, handle, object_key, _page)| {
+                    ((routing_bucket, handle), object_key)
+                })
+                .collect(),
+        }
+    }
+
+    /// The object the page at this position belongs to.
+    ///
+    /// A PANIC AND NOT AN `Option`, for [`pages_with_identity`]'s reason: a page that nothing
+    /// beside it names is a state the producer refuses, and a caller handed `None` would reach
+    /// for a skip. Every caller here is walking the same index this was taken from, so the only
+    /// way to miss is to ask at a position that does not exist.
+    pub(super) fn at(&self, routing_bucket: u32, handle: u64) -> &std::sync::Arc<str> {
+        self.by_position.get(&(routing_bucket, handle)).unwrap_or_else(|| {
+            panic!(
+                "no page is filed at bucket {routing_bucket} handle {handle} in the index this                  was taken from"
+            )
+        })
+    }
+}
+
+/// EVERY PAGE OF ONE CORE INDEX, WITH THE OBJECT THAT THE STRUCTURES BESIDE IT NAME.
+///
+/// # WHY THIS IS SHARED AND NOT A WALK PER TEST
+///
+/// `BlockIndex` carries no object key. Every test that walked a real store's buckets and asked a
+/// page which object it belonged to now has to ask the bucket instead, and there are some forty
+/// such walks across this module tree. Written out one by one they are forty chances to pick the
+/// WRONG DOOR, and the wrong door fails silently rather than loudly:
+///
+///   * [`PageKeysByPosition::live_identity`] answers from the object lookup alone, and
+///     `insert_object_block_lookup` returns early on a deleted page -- so it names NO tombstone.
+///     A walk that reports on deleted pages and asks that door drops every one of them and comes
+///     back with a smaller, entirely plausible number.
+///   * [`PageKeysByPosition::identity_of`] knows about both sources: the lookup for a live page,
+///     and the bucket's own tombstone row for a deleted one. That is what this asks, so a caller
+///     cannot get the tombstone case wrong by omitting to think about it.
+///
+/// # A LIVE PAGE NAMED BY NOTHING IS A PANIC; AN UNNAMED TOMBSTONE IS A SKIP
+///
+/// THIS WAS A FLAT PANIC OVER BOTH STATES AND THAT WAS WRONG, AND THE SUITE IS WHAT SAID SO. The
+/// paragraph here read "A PAGE NAMED BY NOTHING IS A PANIC, NOT A SKIP ... Both are states a test
+/// walking a store should fail on, loudly", naming the window between a decode and its rebuild and
+/// a removal that named no element.
+///
+/// THE SECOND IS NOT A DEFECT, AND `identity_of`'s OWN DOC SAYS SO: a deleted page whose removal
+/// named no element "is the one page in this store whose object nothing beside it states".
+/// Production's `page_identities_in` skips it through a `filter_map`, with the note that in every
+/// caller it means "this page is not the one I am matching".
+///
+/// `hash_read_union_divergence::an_index_entry_marked_deleted_loses_no_field_and_is_not_counted`
+/// plants exactly that page -- it marks an entry deleted in place, with no tombstone row -- and
+/// the flat panic fired while this walk was still BUILDING its list, before any caller's
+/// `!page.deleted` filter could short-circuit. A test whose whole subject is that page could not
+/// run.
+///
+/// SO THE TWO STATES ARE SPLIT, and the assertion says which is which:
+///
+///   * a LIVE page the lookup does not name PANICS with the handle. That is the decode-before-
+///     rebuild window, which the decoder closed by filing as it decodes, so it is a defect.
+///   * a DELETED page no tombstone row names is SKIPPED. Its object is genuinely unstated and
+///     there is nothing for a walk to attribute it to.
+///
+/// A skip is still the dangerous direction, which is why only the second case gets one: a skip on
+/// the first would be a count quietly short, the denominator mistake this campaign keeps
+/// re-finding in a new costume.
+///
+/// # WHAT THIS IS NOT FOR
+///
+/// A test whose SUBJECT is a page filed under a bucket its key does not route to. This asks by
+/// POSITION, and the lookup names such a page at the position it was filed under, not the one it
+/// now sits in -- so this would panic on the very state that test is driving.
+/// [`PageKeysByPosition::identity_anywhere`] is the door for that, and
+/// `bucket_fill`'s mis-filing walk uses it directly and says so.
+pub(super) fn pages_with_identity(
+    index: &crate::engine::state::CoreIndex,
+) -> Vec<(u32, u64, std::sync::Arc<str>, &crate::engine::state::BlockIndex)> {
+    let keys = crate::engine::state::PageKeysByPosition::from_lookup(&index.object_block_lookup);
+    let mut out = Vec::new();
+    for bucket in index.bucket_map.values() {
+        for (handle, page) in &bucket.block_index {
+            let Some(beside) = keys.identity_of(bucket, *handle, page) else {
+                assert!(
+                    page.deleted,
+                    "the LIVE page at handle {handle} in bucket {} is named by nothing beside \n                     it, and a live page is named by the object lookup unless the index is in \n                     the one window the decoder closed by filing as it decodes",
+                    bucket.routing_bucket
+                );
+                continue;
+            };
+            out.push((
+                bucket.routing_bucket,
+                *handle,
+                std::sync::Arc::clone(beside.object_key),
+                page,
+            ));
+        }
+    }
+    out
+}
+
 fn wait_for_fresh_admission_second() {
     loop {
         let elapsed = SystemTime::now()
@@ -291,3 +415,8 @@ mod gated_corpus_across_a_store_boundary;
 mod write_after_fold;
 mod collapse_for_list;
 mod zset_component_drops_the_score;
+mod entry_width_at_each_step;
+mod an_assigned_durable_id_defeats_ground_one_only;
+mod what_the_core_index_puts_on_the_wire;
+mod the_write_path_leaves_the_bucket_ttl_alone;
+mod marking_an_object_dirty_reaches_its_pages;

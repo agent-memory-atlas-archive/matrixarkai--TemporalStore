@@ -326,17 +326,13 @@ fn both_gone_field_sum() -> usize {
 /// one. A parallel literal would have gone on summing a field that was no longer there.
 fn live_entry_field_sum() -> usize {
     let probe = BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 0,
         object_key: Arc::from("slot-probe"),
         model_id: StoredModelKind::String,
         address: an_address(),
         dirty: false,
         deleted: false,
     };
-    std::mem::size_of_val(&probe.kind)
-        + std::mem::size_of_val(&probe.routing_bucket)
-        + std::mem::size_of_val(&probe.object_key)
+    std::mem::size_of_val(&probe.object_key)
         + std::mem::size_of_val(&probe.model_id)
         + std::mem::size_of_val(&probe.address)
         + std::mem::size_of_val(&probe.dirty)
@@ -380,9 +376,9 @@ fn the_ordinal_would_make_the_entry_thirty_two_which_is_now_the_target() {
         std::mem::size_of::<BlockIndex>()
     );
     assert_eq!(
-        40,
+        35,
         live_entry_field_sum(),
-        "the live entry's fields add up to {} in 40, so the ZERO SLACK this whole leg was priced \
+        "the live entry's fields add up to {} rather than 35; two LOG-ONLY fields left the entry, so the ZERO SLACK this leg was priced \
          against is gone",
         live_entry_field_sum()
     );
@@ -458,7 +454,10 @@ fn the_ordinal_would_make_the_entry_thirty_two_which_is_now_the_target() {
     // expressed as the live sum plus the field that left -- which keeps it tied to `BlockIndex`
     // rather than to the literal 56.
     assert_eq!(
-        live_entry_field_sum() + std::mem::size_of::<Option<Arc<str>>>(),
+        live_entry_field_sum() + std::mem::size_of::<Option<Arc<str>>>()
+        + std::mem::size_of::<crate::index_log::IndexItemKind>()   // kind, retired
+        + std::mem::size_of::<u32>()                               // routing_bucket, retired
+            ,
         ordinal_entry_field_sum() - std::mem::size_of::<u32>() + std::mem::size_of::<Arc<str>>(),
         "the ordinal mirror does not reconstruct to the entry it was measured against -- the live \
          sum plus the element name's {} bytes -- so it is not that entry with one field swapped",
@@ -469,7 +468,10 @@ fn the_ordinal_would_make_the_entry_thirty_two_which_is_now_the_target() {
     // leave. One of them has: the element name is off `BlockIndex`, so putting it back here would
     // double-count it and the identity would miss by sixteen.
     assert_eq!(
-        live_entry_field_sum(),
+        live_entry_field_sum()
+        + std::mem::size_of::<crate::index_log::IndexItemKind>()   // kind, retired
+        + std::mem::size_of::<u32>()                               // routing_bucket, retired
+            ,
         both_gone_field_sum() - std::mem::size_of::<u32>() + std::mem::size_of::<Arc<str>>(),
         "28 does not reconstruct to the live {} by putting the key back, so the 32 probe is not \
          pinned to this type at all",
@@ -601,10 +603,11 @@ fn entries_naming(engine: &TemporalEngine, routing_bucket: u32, object_id: u64) 
     let Some(bucket) = shard.bucket_index.bucket_map.get(&routing_bucket) else {
         return (0, 0);
     };
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut live = 0usize;
     let mut tombstoned = 0usize;
-    for page in bucket.block_index.values() {
-        if page.object_id(SHARD) != object_id {
+    for (handle, page) in &bucket.block_index {
+        if page.object_id(SHARD, named.at(routing_bucket, *handle)) != object_id {
             continue;
         }
         if page.deleted {
@@ -972,7 +975,34 @@ fn the_page_entry_is_the_only_durable_home_of_an_object_keys_characters() {
             .bucket_map
             .get(&routing_bucket)
             .expect("APPARATUS: the bucket holding the key under test is not resident");
-        serde_json::to_value(bucket).expect("a bucket node serializes to its stored shape")
+        // EVERY OBJECT THIS BUCKET HOLDS, TAKEN FROM THE INDEX'S OWN LOOKUP.
+        //
+        // Naming only the key under test was wrong and the encoder said so on the first run: the
+        // forty filler keys route over the same slot space and at least one of them lands here,
+        // so a list of one left a page unaccounted for. That is the hole `NodeNamedBy` exists to
+        // refuse -- the keyless encode used to write a key naming nothing, once per page, and
+        // return `Ok` -- and it is also why this list is DERIVED rather than written out: a
+        // hand-written one goes stale the next time the fixture's key count or slot range moves.
+        //
+        // THE KEY UNDER TEST IS STILL ASSERTED TO BE AMONG THEM, because the arm below reads the
+        // serialized node for that key's characters and a bucket that did not hold it would make
+        // every row of that search vacuous.
+        let objects: Vec<&str> = shard
+            .bucket_index
+            .object_block_lookup
+            .iter()
+            .filter(|(_, _, refs)| {
+                refs.iter().any(|block_ref| block_ref.routing_bucket == routing_bucket)
+            })
+            .map(|(_, object, _)| object.as_ref())
+            .collect();
+        assert!(
+            objects.iter().any(|object| *object == PRESENT_KEY),
+            "APPARATUS: the bucket this test reads does not hold {PRESENT_KEY}, so the search \
+             below is over a node that never carried it"
+        );
+        serde_json::to_value(crate::engine::state::NodeNamedBy(bucket, &objects))
+            .expect("a bucket node serializes to its stored shape")
     };
     let members = node_wire.as_object().expect(
         "APPARATUS: a bucket node does not serialize as an object, so its members cannot be \

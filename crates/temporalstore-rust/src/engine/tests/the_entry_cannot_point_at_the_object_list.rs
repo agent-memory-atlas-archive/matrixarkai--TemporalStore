@@ -223,16 +223,18 @@ fn pages_and_index_rows(
     let shard = shards.get(&1).expect("shard 1 is loaded");
     let mut pages = 0usize;
     let mut rows: BTreeSet<u64> = BTreeSet::new();
-    for bucket in shard.bucket_index.bucket_map.values() {
-        for page in bucket.block_index.values() {
-            if page.deleted || page.model_id.as_str() != kind {
-                continue;
-            }
-            if !keys.contains(&*page.object_key) {
-                continue;
-            }
-            pages += 1;
+    for (_routing_bucket, _handle, object_key, page) in
+        super::pages_with_identity(&shard.bucket_index)
+    {
+        if page.deleted || page.model_id.as_str() != kind {
+            continue;
         }
+        if !keys.contains(&*object_key) {
+            continue;
+        }
+        pages += 1;
+    }
+    for bucket in shard.bucket_index.bucket_map.values() {
         for object_id in &bucket.object_index {
             if wanted.contains(object_id) {
                 rows.insert(*object_id);
@@ -253,11 +255,11 @@ fn pages_of_key(engine: &TemporalEngine, kind: &str, key: &str) -> usize {
     let shards = engine.shards.read().expect("engine lock poisoned");
     let shard = shards.get(&1).expect("shard 1 is loaded");
     let mut held = 0usize;
-    for bucket in shard.bucket_index.bucket_map.values() {
-        for page in bucket.block_index.values() {
-            if !page.deleted && page.model_id.as_str() == kind && &*page.object_key == key {
-                held += 1;
-            }
+    for (_routing_bucket, _handle, object_key, page) in
+        super::pages_with_identity(&shard.bucket_index)
+    {
+        if !page.deleted && page.model_id.as_str() == kind && &*object_key == key {
+            held += 1;
         }
     }
     held
@@ -354,8 +356,6 @@ fn a_u16_ordinal_would_take_the_entry_from_forty_to_twenty_four_and_a_u8_adds_no
         ("address", offset_of!(BlockIndex, address), size_of::<ElementEntry>()),
         ("dirty", offset_of!(BlockIndex, dirty), size_of::<bool>()),
         ("deleted", offset_of!(BlockIndex, deleted), size_of::<bool>()),
-        ("kind", offset_of!(BlockIndex, kind), size_of::<crate::index_log::IndexItemKind>()),
-        ("routing_bucket", offset_of!(BlockIndex, routing_bucket), size_of::<u32>()),
     ];
     let (covered, slack) = account(&entry_fields, entry_total);
 
@@ -470,6 +470,7 @@ fn the_object_list_holds_ids_and_the_entry_already_answers_the_id_without_one() 
     let shards = engine.shards.read().expect("engine lock poisoned");
     let shard = shards.get(&1).expect("shard 1 is loaded");
 
+    let ordinal_names = super::PageObjects::of(&shard.bucket_index);
     let mut rows_seen = 0usize;
     let mut pages_seen = 0usize;
     let mut id_already_answered = 0usize;
@@ -482,16 +483,17 @@ fn the_object_list_holds_ids_and_the_entry_already_answers_the_id_without_one() 
             let _: &u64 = _id;
             rows_seen += 1;
         }
-        for page in bucket.block_index.values() {
+        for (handle, page) in &bucket.block_index {
             // Only the kind this fixture seeded, so an incidental page of another kind cannot
             // decide the assertion below.
             if page.deleted || page.model_id.as_str() != "hash" {
                 continue;
             }
             pages_seen += 1;
+            let object_key = ordinal_names.at(bucket.routing_bucket, *handle);
             // What the entry can answer WITHOUT an ordinal, from the address alone.
-            let from_address = page.object_id(1);
-            let recomputed = stable_block_object_id(1, page.model_id.as_str(), &page.object_key);
+            let from_address = page.object_id(1, object_key);
+            let recomputed = stable_block_object_id(1, page.model_id.as_str(), object_key);
             if from_address == recomputed {
                 id_already_answered += 1;
             }

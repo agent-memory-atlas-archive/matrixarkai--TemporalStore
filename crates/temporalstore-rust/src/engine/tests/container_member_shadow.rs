@@ -181,15 +181,16 @@ struct ZsetBlock {
 fn zset_pages(engine: &TemporalEngine) -> Vec<ZsetBlock> {
     let shards = engine.shards.read().expect("engine lock poisoned");
     let shard = shards.get(&1).expect("shard is loaded");
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut pages = Vec::new();
     for (routing_bucket, bucket) in &shard.bucket_index.bucket_map {
-        for (_handle, page) in bucket.block_index.iter() {
+        for (handle, page) in bucket.block_index.iter() {
             if page.model_id.as_str() != "zset" {
                 continue;
             }
             pages.push(ZsetBlock {
                 routing_bucket: *routing_bucket,
-                object_key: page.object_key.to_string(),
+                object_key: named.at(*routing_bucket, *handle).to_string(),
                 // THIS `expect` WAS THE MODULE'S OWN CONTROL AND IT CANNOT HOLD. It read
                 // `page.component.as_deref().expect("a zset page is named by its component")`.
                 // A zset page entry names no element -- that is the collapse -- so the walk
@@ -349,8 +350,6 @@ fn every_byte_of_a_zset_members_index_shadow_is_accounted_for() {
         ("address", offset_of!(BlockIndex, address), size_of::<crate::block_store::ElementEntry>()),
         ("dirty", offset_of!(BlockIndex, dirty), size_of::<bool>()),
         ("deleted", offset_of!(BlockIndex, deleted), size_of::<bool>()),
-        ("kind", offset_of!(BlockIndex, kind), size_of::<crate::index_log::IndexItemKind>()),
-        ("routing_bucket", offset_of!(BlockIndex, routing_bucket), size_of::<u32>()),
     ];
     let (index_covered, index_padding) = account(&index_fields, index_total);
 

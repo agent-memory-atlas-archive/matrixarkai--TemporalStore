@@ -505,9 +505,27 @@ impl ShardState {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+// BOTH DIRECTIONS ARE HAND-WRITTEN NOW, AND THE DECODER IS WHY THE ATTRIBUTES ARE GONE.
+//
+// The encoder has to be hand-written because the page index needs a SIBLING FIELD of this
+// struct in scope -- serde hands a `Serialize` impl no context, so a bucket's encoder can see
+// nothing but the bucket, and the blanket map impl between them is where the chain breaks.
+//
+// THE DECODER NEEDS THE SAME THING IN THE OTHER DIRECTION. A page's identity arrives inside the
+// page index, and `object_block_lookup` -- a sibling field of this struct -- is keyed by it.
+// Rebuilding that lookup after the load by walking the decoded entries is what this replaces, and
+// that walk reads the identity off each entry, which is the one place it is about to stop being.
+//
+// AND THAT COST THE ATTRIBUTES, WHICH WAS THE RECORDED RISK OF DOING IT. They are only valid
+// while a derive consumes them, so `alias = "slots"`, the defaults and the skips stop being
+// DECLARATIONS the compiler enforces and become code that has to be read to be believed. Each is
+// restated below as the arm that implements it, and
+// `the_legacy_spelling_of_the_one_wire_field_still_loads_and_an_unknown_one_does_not` is the guard
+// that was landed against the derive for exactly this moment: its discriminating pair is that the
+// legacy spelling decodes POPULATED and an unrecognised one decodes EMPTY, which is the only form
+// of the claim that is not true of any input whatsoever.
+#[derive(Debug, Clone)]
 pub(super) struct CoreIndex {
-    #[serde(default, alias = "slots")]
     pub(super) bucket_map: BucketMap,
     /// Per-slab live block refs and live bytes, maintained by every mutation of the map above.
     ///
@@ -520,12 +538,19 @@ pub(super) struct CoreIndex {
     ///
     /// Derived, never persisted. Seeded by `seed_block_slab_live` wherever the index is rebuilt
     /// wholesale; until then `is_ready` is false and every consumer falls back to the walk.
-    #[serde(skip)]
+    ///
+    /// NOT ON THE WIRE IN EITHER DIRECTION. This carried `#[serde(skip)]`; the decoder below
+    /// names no arm for it, so a stored key of this name is ignored exactly as the derive ignored
+    /// it, and the encoder never wrote it.
     pub(super) block_slab_live: BlockSlabLiveIndex,
     // Derived lookup tables rebuilt from the bucket map on load. Persisting them duplicates
     // block references already carried by the bucket index and made large context backfill
     // checkpoints tens of MB larger without adding authoritative recovery state.
-    #[serde(default, skip_serializing)]
+    ///
+    /// DECODED IF PRESENT AND NEVER WRITTEN, which is what `#[serde(default, skip_serializing)]`
+    /// said and what the decoder below still does: it takes a stored value when a store carries
+    /// one, defaults when it does not, and files each decoded page on top of whatever it started
+    /// from.
     pub(super) object_block_lookup: ObjectBlockLookup,
     /// One shared copy of each block kind, so a block holds a pointer rather than its own string.
     ///
@@ -551,8 +576,7 @@ pub(super) struct CoreIndex {
     ///
     /// Owned by the index rather than a global, so the write path interns through the `&mut` it
     /// already holds and no lock appears on it. Not serialized -- it is a sharing detail, not part
-    /// of the index.
-    #[serde(skip)]
+    /// of the index, and the decoder below names no arm for it.
     pub(super) kind_pool: std::collections::HashSet<Arc<str>>,
     /// Running total of block refs across `object_component_lookup`, or `None` when not known.
     ///
@@ -568,7 +592,11 @@ pub(super) struct CoreIndex {
     /// recomputed by `rebuild_object_block_lookup`. `None` means "not established yet" (a
     /// freshly deserialized index, before any rebuild) and the reader falls back to the walk,
     /// so a missing value costs time rather than correctness.
-    #[serde(skip)]
+    ///
+    /// ESTABLISHED BY THE DECODE NOW, where it used to be established by the rebuild that followed
+    /// one. The decoder sets it to zero before it files a single page and lets each filing count,
+    /// which is the same bargain `rebuild_object_block_lookup` makes -- a count that starts at
+    /// "unknown" cannot be incremented into a right answer.
     pub(super) object_component_block_refs: Option<usize>,
     /// Buckets whose block list has been released: present in `bucket_map`, `in_memory: false`,
     /// `page_index` empty, reloadable from the model maps on demand.
@@ -584,8 +612,491 @@ pub(super) struct CoreIndex {
     /// bucket is released decodes with that bucket simply holding no blocks, and every load path
     /// re-derives `bucket_map` from the model maps anyway -- which is why the release rules above
     /// refuse the three model maps that are themselves rebuilt from the index.
-    #[serde(skip)]
+    ///
+    /// Not serialized in either direction; the decoder below names no arm for it.
     pub(super) released_buckets: BTreeSet<u32>,
+}
+
+/// HAND-WRITTEN FOR ONE FIELD, AND BECAUSE A LIST OF CONSTRUCTION SITES COULD NOT BE EXHAUSTIVE.
+///
+/// `object_component_block_refs` is `Some(0)` from birth rather than `None`. `None` means "nobody
+/// has established this count", and `insert_object_block_lookup` increments only `if let Some`, so
+/// a count left at `None` can never be incremented into a right answer -- it has to START at a
+/// number. The decoder already said exactly that and set zero before its first filing; this makes
+/// the same statement for every other way an index comes into existence.
+///
+/// # WHY NOT VISIT THE CONSTRUCTION SITES INSTEAD -- ENUMERATED BY THE COMPILER, NOT GREPPED
+///
+/// Taking `Default` off the derive and compiling names every construction. There are two EXPLICIT
+/// production sites -- `rebuild_bucket_first_index` and the decoder -- and THREE IMPLICIT routes
+/// that no site list can cover:
+///
+///   * `ShardState` derives `Default`, so `ShardState::default()` builds one;
+///   * `bucket_index` carries `#[serde(default)]`, so a stored index that omits `slot_index`
+///     decodes through THIS and not through the hand-written `Deserialize` that sets zero -- which
+///     is the route that matters, because it is a real file on a real load; and
+///   * any `..Default::default()` in a struct update.
+///
+/// A site list would also go stale the first time someone adds a fourth route, with nothing
+/// failing. Put on the type, the claim holds for every route that exists and every route anyone
+/// adds, and a field added to this struct later is a COMPILE ERROR here rather than a silent
+/// `Default::default()` nobody chose.
+///
+/// AN EMPTY INDEX'S REF TOTAL IS NOT UNKNOWN, IT IS ZERO, which is the other half of why this is a
+/// correction rather than a convenience. The two production readers test
+/// `object_block_lookup.is_empty() || object_component_block_refs.is_none()` and read either half
+/// as "needs establishing". The FIRST half still answers for an index holding pages its lookup
+/// does not name, so what this removes is only the arm that called a known zero unknown -- and in
+/// exchange, an index that files as it goes now carries a maintained total without a rebuild
+/// having to establish one.
+///
+/// `a_default_index_reports_a_ref_total_of_zero_by_every_route_one_is_built` drives all three
+/// implicit routes plus both decode paths.
+impl Default for CoreIndex {
+    fn default() -> Self {
+        Self {
+            bucket_map: BucketMap::default(),
+            block_slab_live: BlockSlabLiveIndex::default(),
+            object_block_lookup: ObjectBlockLookup::default(),
+            kind_pool: std::collections::HashSet::default(),
+            object_component_block_refs: Some(0),
+            released_buckets: BTreeSet::default(),
+        }
+    }
+}
+
+/// WHICH KEY OF A STORED INDEX THIS IS, including the one spelling that is only ever read.
+enum CoreIndexField {
+    /// `bucket_map`, and `slots` -- THE LEGACY SPELLING, which was `alias = "slots"` while a
+    /// derive consumed it. An index written before the rename is keyed `slots`, and dropping this
+    /// arm is a store that stops loading with no other symptom: a round trip would still pass,
+    /// because a round trip only ever writes the CURRENT spelling and reads it back.
+    BucketMap,
+    /// `object_block_lookup`: decoded if a store carries one, never written.
+    ObjectBlockLookup,
+    /// Everything else, INCLUDING the four fields that are not on the wire at all. Ignored rather
+    /// than refused, which is what lets an index written by a newer engine load into an older one.
+    Ignore,
+}
+
+impl<'de> Deserialize<'de> for CoreIndexField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+            type Value = CoreIndexField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a core index field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<CoreIndexField, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(match value {
+                    "bucket_map" | "slots" => CoreIndexField::BucketMap,
+                    "object_block_lookup" => CoreIndexField::ObjectBlockLookup,
+                    _ => CoreIndexField::Ignore,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+const CORE_INDEX_FIELDS: &[&str] = &["bucket_map", "object_block_lookup"];
+
+impl<'de> Deserialize<'de> for CoreIndex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IndexVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for IndexVisitor {
+            type Value = CoreIndex;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a core index")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<CoreIndex, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+
+                let mut buckets: Option<BTreeMap<u32, BucketNodeWithPageKeys>> = None;
+                let mut stored_lookup: Option<ObjectBlockLookup> = None;
+                while let Some(key) = map.next_key::<CoreIndexField>()? {
+                    match key {
+                        CoreIndexField::BucketMap => {
+                            // A SECOND STATEMENT OF THE SAME FACT IS REFUSED, as every arm of the
+                            // node's decoder refuses one: a store carrying both spellings of this
+                            // key is two disagreeing statements and must fail loudly.
+                            if buckets.is_some() {
+                                return Err(M::Error::duplicate_field("bucket_map"));
+                            }
+                            buckets = Some(map.next_value()?);
+                        }
+                        CoreIndexField::ObjectBlockLookup => {
+                            if stored_lookup.is_some() {
+                                return Err(M::Error::duplicate_field("object_block_lookup"));
+                            }
+                            stored_lookup = Some(map.next_value()?);
+                        }
+                        CoreIndexField::Ignore => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let mut index = CoreIndex {
+                    object_block_lookup: stored_lookup.unwrap_or_default(),
+                    ..CoreIndex::default()
+                };
+                // ZERO BEFORE THE FIRST FILING, not after the last. `insert_object_block_lookup`
+                // increments only `if let Some(total)`, so a count left at `None` can never be
+                // incremented into a right answer -- it has to START at a number.
+                //
+                // KEPT THOUGH `Default` NOW SAYS THE SAME THING, because this decoder does not go
+                // through `Default` for this field in every arm it could gain, and because the
+                // statement belongs where the filing loop below can be read beside it. It is a
+                // restatement rather than a second mechanism: both write the same zero, and
+                // `impl Default for CoreIndex` carries the argument for why a site list cannot be
+                // relied on to.
+                index.object_component_block_refs = Some(0);
+                for (routing_bucket, decoded) in buckets.unwrap_or_default() {
+                    for (handle, object_key) in &decoded.page_keys {
+                        // THE PAGE IS LOOKED UP BY THE HANDLE IT WAS FILED UNDER rather than
+                        // carried beside its key, so the entry the lookup records is the entry the
+                        // map holds. A page whose handle collided with an earlier one is not in
+                        // the map twice and must not be in the lookup twice either.
+                        if let Some(page) = decoded.node.block_index.get(handle) {
+                            index.insert_object_block_lookup(
+                                routing_bucket,
+                                *handle,
+                                object_key,
+                                page,
+                            );
+                        }
+                    }
+                    index.bucket_map.insert(routing_bucket, decoded.node);
+                }
+                Ok(index)
+            }
+        }
+
+        deserializer.deserialize_struct("CoreIndex", CORE_INDEX_FIELDS, IndexVisitor)
+    }
+}
+
+/// WHERE EACH PAGE'S OBJECT IDENTITY LIVES, INDEXED BY THE POSITION THE PAGE IS HELD AT.
+///
+/// The object lookup runs object -> refs. This is that map inverted once per encode, so a page can
+/// be asked for its identity by the `(routing_bucket, handle)` it is filed under, which is the only
+/// thing a page's position actually says about it.
+///
+/// BUILT IN EVERY BUILD NOW, AND THAT COSTS ONE PASS PER READER THAT NEEDS IT.
+///
+/// It was `#[cfg(debug_assertions)]`, because while the identity was still on the entry this was
+/// only a CHECK on the bytes the entry produced. It is a SOURCE now: the readers that group pages
+/// by object have no other way to ask which object a page belongs to, so the inversion has to
+/// exist in a release build.
+///
+/// WHAT THAT COSTS, STATED RATHER THAN GLOSSED. One pass over the lookup per reader that builds
+/// one, which is O(block refs) -- the same order as the walk over pages the reader is already
+/// doing. It is built ONCE per report and queried per page, never built per page, and never built
+/// by a point reader: a reader that starts from an object goes through `block_refs_for` in the
+/// forward direction and needs none of this.
+///
+/// THE DELETED PAGES ARE NOT IN IT, and that is the lookup's rule rather than this type's:
+/// `insert_object_block_lookup` returns early on a deleted page. [`page_identity`] is the door
+/// that knows about both sources, and every reader goes through it rather than through `get`.
+/// WHAT A PAGE'S NEIGHBOURS SAY ITS OBJECT IS.
+///
+/// The object key is handed back as the SHARED POINTER rather than as characters, because every
+/// caller that keeps it keeps a pointer -- the report rows, the filing map and the index-log items
+/// all held `page.object_key.clone()` and must go on costing one pointer rather than a copy of the
+/// characters.
+///
+/// The kind is handed back as `&str` because that is what both sources hold it as: the lookup keys
+/// on the shared name and a tombstone row holds the one-byte spelling, whose `as_str` is static.
+pub(super) struct PageObjectIdentity<'a> {
+    pub(super) model_id: &'a str,
+    pub(super) object_key: &'a Arc<str>,
+}
+
+pub(super) struct PageKeysByPosition<'a> {
+    by_position: std::collections::HashMap<(u32, u64), (&'a Arc<str>, &'a Arc<str>)>,
+    /// THE SAME ANSWER WITHOUT THE BUCKET, FOR THE ONE QUESTION POSITION CANNOT ANSWER.
+    ///
+    /// `by_position` is the right index for every reader that asks "which object is the page at
+    /// this position", because position is what a page's filing states about it. It cannot answer
+    /// for a page that is filed in the WRONG bucket -- the lookup names it at the position it was
+    /// filed under, so asking at the position it now sits in finds nothing.
+    ///
+    /// THAT STATE IS NOT HYPOTHETICAL AND IT IS NOT AN ERROR TO SWALLOW. It is precisely what
+    /// `validate_bucket_ownership_index_from_entries` exists to find, and
+    /// `bucket_filing_range::the_ownership_report_names_a_page_filed_where_its_key_does_not_route`
+    /// drives it: a node moved under a bucket its key does not route to must be NAMED, once per
+    /// page. A walk that dropped those rows would hand the validator an empty set and the report
+    /// would say the index is healthy.
+    ///
+    /// SO THIS IS A SECOND INDEX AND NOT A REPLACEMENT. Only the entry-collecting walk reads it,
+    /// through [`Self::identity_anywhere`], and the doc there says why. A handle is hashed from a
+    /// block's identity and its address, so two pages share one only by being the same block --
+    /// which is the same assumption `BlockIndexMap` already keys on.
+    by_handle: std::collections::HashMap<u64, (&'a Arc<str>, &'a Arc<str>)>,
+}
+
+impl<'a> PageKeysByPosition<'a> {
+    /// REACHABLE FROM THE SIBLING MODULE THAT DERIVES, not only from this file's encoder.
+    ///
+    /// It was private while the only builder was `CoreIndex::serialize` one screen below. The
+    /// bucket-layout rebuild in `storage_bucket_internals` is a second builder, and it has to
+    /// hoist its own: the inversion borrows `object_block_lookup` while the rebuild holds
+    /// `bucket_map` mutably, and only the caller can split those two borrows apart by naming the
+    /// fields. `CoreIndex::page_identities` cannot be used there for exactly that reason -- it
+    /// borrows the whole index.
+    pub(super) fn from_lookup(lookup: &'a ObjectBlockLookup) -> Self {
+        let mut by_position = std::collections::HashMap::new();
+        let mut by_handle = std::collections::HashMap::new();
+        for (model_id, object_key, refs) in lookup.iter() {
+            for block_ref in refs.iter() {
+                by_position.insert(
+                    (block_ref.routing_bucket, block_ref.block_ref_key),
+                    (model_id, object_key),
+                );
+                by_handle.insert(block_ref.block_ref_key, (model_id, object_key));
+            }
+        }
+        Self {
+            by_position,
+            by_handle,
+        }
+    }
+
+    /// THE IDENTITY OF A LIVE PAGE AT A POSITION, AND ONLY OF A LIVE ONE.
+    ///
+    /// Named rather than spelled `get` because it answers for ONE of the two sources: the lookup
+    /// holds no deleted page, so a caller that may be looking at a tombstone wants
+    /// [`Self::identity_of`], which knows about both. A caller that has already filtered
+    /// `!page.deleted` wants this, and wants it WITHOUT the node: this borrows the lookup alone,
+    /// so it can be asked while the node is held mutably. `identity_of` cannot be -- it hands back
+    /// a tombstone row and so borrows the node for as long as the answer lives.
+    pub(super) fn live_identity(
+        &self,
+        routing_bucket: u32,
+        handle: u64,
+    ) -> Option<(&'a Arc<str>, &'a Arc<str>)> {
+        self.by_position.get(&(routing_bucket, handle)).copied()
+    }
+
+    /// THE OBJECT A PAGE BELONGS TO, FROM WHICHEVER STRUCTURE BESIDE THE PAGE STATES IT.
+    ///
+    /// TWO SOURCES AND NOT ONE, because a page has one of two kinds of neighbour. A LIVE page is
+    /// named by the object lookup, inverted by the `(routing_bucket, handle)` it is filed under. A
+    /// DELETED page is not in that lookup at all -- `insert_object_block_lookup` returns early on
+    /// one -- and is named instead by the tombstone row the removal filed in the same bucket,
+    /// which is keyed by the page triple and carries both the object key and the kind.
+    ///
+    /// `None` HAS EXACTLY TWO CAUSES, both named so that a caller's skip is not a shrug. A live
+    /// page is missing from the lookup only between a decode and a rebuild, a window the decoder
+    /// closed by filing as it decodes. A deleted page is missing a row only when the removal that
+    /// made it named no element -- a tombstone with nothing to say about which member went -- and
+    /// that is the one page in this store whose object nothing beside it states.
+    pub(super) fn identity_of(
+        &self,
+        node: &'a BucketNode,
+        handle: u64,
+        page: &BlockIndex,
+    ) -> Option<PageObjectIdentity<'a>> {
+        if page.deleted {
+            return node.tombstone_element_at(&page.address).map(|row| PageObjectIdentity {
+                model_id: row.model_id.as_str(),
+                object_key: &row.object_key,
+            });
+        }
+        self.live_identity(node.routing_bucket, handle)
+            .map(|(model_id, object_key)| PageObjectIdentity {
+                model_id,
+                object_key,
+            })
+    }
+
+    /// WHETHER THIS NAMES NO POSITION AT ALL, which is what an UNESTABLISHED lookup looks like.
+    ///
+    /// The lookup is `skip_serializing` and empty between a decode and the rebuild that fills it,
+    /// so an encode taken in that window has no identity beside any page. That is a state with a
+    /// NAME, and the check below refuses a missing source unless this is true -- which is the
+    /// difference between a skip with a reason and a skip that hides the one case that matters.
+    pub(super) fn names_no_position(&self) -> bool {
+        self.by_position.is_empty()
+    }
+
+    /// THE OBJECT A PAGE BELONGS TO, WHEREVER IT IS FILED -- FOR ONE CALLER AND ONE REASON.
+    ///
+    /// Every other reader asks by POSITION, because what a page's filing states about it is where
+    /// it sits. This asks by HANDLE alone, which answers for a page the lookup names at a
+    /// different position than the one it is now in.
+    ///
+    /// # WHY THAT IS NOT A LOOPHOLE
+    ///
+    /// The one caller is `collect_bucket_index_live_block_entries`, whose rows feed
+    /// `validate_bucket_ownership_index_from_entries` -- a check whose entire content is comparing
+    /// where a page IS against where its key ROUTES. A mis-filed page is the subject of that
+    /// check, so a walk that could not name one would hand it an empty set and the report would
+    /// call a damaged index healthy. Measured: moving one node under a bucket its key does not
+    /// route to must produce one mismatch per page, and does.
+    ///
+    /// IT IS STRICTLY WIDER THAN `identity_of` AND NEVER DISAGREES WITH IT. A page the position
+    /// index names is named here with the same pair, because both are filled from the same refs.
+    /// What it adds is an answer where the position index has none.
+    ///
+    /// DELETED PAGES ARE STILL NOT IN IT, for the lookup's own reason:
+    /// `insert_object_block_lookup` returns early on one. A caller that must answer for a
+    /// tombstone wants [`Self::identity_of`], which knows about the bucket's rows as well.
+    pub(super) fn identity_anywhere(&self, handle: u64) -> Option<(&'a Arc<str>, &'a Arc<str>)> {
+        self.by_handle.get(&handle).copied()
+    }
+}
+
+/// THE IDENTITY OF EVERY PAGE IN ONE BUCKET, OWNED, SO A MUTATION CAN HOLD THE BUCKET.
+///
+/// # WHY THIS EXISTS AND IS NOT JUST `identity_of` IN A LOOP
+///
+/// `BlockIndexMap::retain` borrows the page index MUTABLY, and [`PageKeysByPosition::identity_of`]
+/// needs the NODE -- because a deleted page's identity lives in the node's tombstone rows and not
+/// in the lookup. So a `retain` closure cannot ask which object the page it is looking at belongs
+/// to: the borrow checker refuses it, and rightly, since the answer is drawn in part from the
+/// structure being mutated.
+///
+/// Taken once BEFORE the mutation, from the same two sources, keyed by the handle the closure is
+/// handed. A handle the result does not contain is a page NEITHER source names -- the caller
+/// decides what that means, and in every current caller it means "this page is not the one I am
+/// matching", which is the conservative direction: a predicate cannot match an object key the
+/// page has none of, and widening it would take every sibling page of the bucket with it.
+///
+/// ONE PASS OVER ONE BUCKET, not over the shard. The inversion it is given is built once per
+/// caller and shared across that caller's buckets; this is the per-bucket projection of it.
+pub(super) fn page_identities_in(
+    node: &BucketNode,
+    keys: &PageKeysByPosition<'_>,
+) -> std::collections::HashMap<u64, Arc<str>> {
+    node.block_index
+        .iter()
+        .filter_map(|(handle, page)| {
+            keys.identity_of(node, *handle, page)
+                .map(|beside| (*handle, Arc::clone(beside.object_key)))
+        })
+        .collect()
+}
+
+/// THE ONE FIELD OF THIS STRUCT THAT REACHES THE WIRE, and the context the rest of the encode needs.
+///
+/// Hand-written for the reason stated at the struct: the page index has to be composed where a
+/// SIBLING of the bucket map is in scope, and no derive and no `serialize_with` can offer that,
+/// because both see one field at a time.
+///
+/// THE FIELD COUNT IS PART OF THE ENCODING, not a hint. The served index is msgpack
+/// `with_struct_map`, so `serialize_struct` writes a map header of exactly this length -- the same
+/// reason `BucketNode` counts its own optional key rather than hard-coding one. One field, because
+/// five of the six are not written, and `what_the_core_index_puts_on_the_wire` observes that from a
+/// real encode rather than reading it off the attributes.
+impl Serialize for CoreIndex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // BUILT IN EVERY BUILD, BECAUSE IT IS THE SOURCE AND NOT A CHECK.
+        //
+        // It was `#[cfg(debug_assertions)]` here while the written key was composed from the
+        // entry's own copy of the identity and this inversion only CONFIRMED it. The key is
+        // composed from the inversion now, so a release build without one would write no key at
+        // all. The type's own doc prices the pass.
+        let keys = PageKeysByPosition::from_lookup(&self.object_block_lookup);
+        let mut index = serializer.serialize_struct("CoreIndex", 1)?;
+        index.serialize_field(
+            "bucket_map",
+            &BucketMapAt {
+                buckets: &self.bucket_map,
+                keys: &keys,
+            },
+        )?;
+        index.end()
+    }
+}
+
+/// The bucket map, with each node given the context the derive could not pass it.
+///
+/// The map is written exactly as the blanket impl wrote it -- same length header, same key order,
+/// same key encoding -- because a `BTreeMap` iterates in key order and that is what it did before.
+/// What changes is which `Serialize` each VALUE goes through.
+struct BucketMapAt<'a> {
+    buckets: &'a BucketMap,
+    keys: &'a PageKeysByPosition<'a>,
+}
+
+impl Serialize for BucketMapAt<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.buckets.len()))?;
+        for (routing_bucket, node) in self.buckets {
+            map.serialize_entry(
+                routing_bucket,
+                &BucketNodeAt {
+                    node,
+                    keys: self.keys,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+/// One node, with the page-key context in scope.
+///
+/// ONE PRODUCTION DOOR NOW, AND THE CONTEXT IS NOT OPTIONAL. `impl Serialize for BucketNode`
+/// stood beside this as the door for a fixture holding a bare node, passing `None` for the
+/// context, and that `None` is the escape hatch this commit closes: a keyless node encode
+/// composes every page key from the entry's own copy of the identity, which with the identity off
+/// the entry is a key naming nothing, once per page, returned as `Ok`.
+///
+/// So the context arrives by value rather than as an `Option`, and the type system is what says a
+/// node this engine writes cannot be encoded without one.
+///
+/// THE FIXTURE DOOR SURVIVES AS A `#[cfg(test)]` SCAFFOLD WITH A NAME THAT SAYS WHAT IT IS, and
+/// it is NOT reachable from production -- `--lib` compiles with no `Serialize for BucketNode` at
+/// all. Twenty of the twenty-six callers of the two fixture doors encode a bare node and six a
+/// bare page map, every one of them a byte-shape or byte-budget assertion over a hand-built
+/// fixture. They are named by [`PageIndexFromTheEntriesOwnCopies`] and they end when the field
+/// does.
+struct BucketNodeAt<'a> {
+    node: &'a BucketNode,
+    keys: &'a PageKeysByPosition<'a>,
+}
+
+impl Serialize for BucketNodeAt<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_bucket_node(
+            self.node,
+            &PageIndexAt { node: self.node, keys: self.keys },
+            serializer,
+        )
+    }
 }
 
 pub(super) type BucketMap = BTreeMap<u32, BucketNode>;
@@ -1381,7 +1892,7 @@ impl<'de> Deserialize<'de> for DeletedObjectIndex {
 /// disk, so a handle has to mean the same block in every process that reads the file. Assigning
 /// them from a counter compiled, round-tripped, and lost an object on the first reload.
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(from = "BTreeMap<String, BlockIndex>")]
+#[serde(from = "BTreeMap<String, StoredPageEntry>")]
 pub(super) enum BlockIndexMap {
     /// A bucket holding nothing: no list, no node, no allocation.
     ///
@@ -1965,22 +2476,27 @@ impl BlockIndexMap {
     /// cannot exercise a handle derived differently from the one production writes. Two doors, one
     /// implementation; the other arrangement is the second path this change exists to delete.
     #[cfg(test)]
-    pub(super) fn insert(&mut self, page: BlockIndex, live: &mut BlockSlabLiveIndex) -> u64 {
-        let handle = block_index_handle(&page);
+    pub(super) fn insert(
+        &mut self,
+        object_key: &str,
+        page: BlockIndex,
+        live: &mut BlockSlabLiveIndex,
+    ) -> u64 {
+        let handle = block_index_handle(object_key, &page);
         self.insert_with_handle(handle, page, live)
     }
 
     /// The other test-only door, delegating for the same reason.
     #[cfg(test)]
-    pub(super) fn insert_released(&mut self, page: BlockIndex) -> u64 {
-        let handle = block_index_handle(&page);
+    pub(super) fn insert_released(&mut self, object_key: &str, page: BlockIndex) -> u64 {
+        let handle = block_index_handle(object_key, &page);
         self.insert_released_with_handle(handle, page)
     }
 
     /// The mechanism, with no accounting: the handle it was GIVEN, and the address it displaced.
     ///
     /// THE HANDLE ARRIVES FROM ABOVE, and that is the whole of this change. It was
-    /// `block_index_handle(&page)` computed right here -- inside the map, from the entry and
+    /// `block_index_handle(&page.object_key, &page)` computed right here -- inside the map, from the entry and
     /// nothing else. A map cannot see the sibling fields of the bucket that owns it, so a term
     /// that leaves the entry for a per-bucket structure becomes unreachable from this line, and
     /// every such term was therefore pinned to the entry by this one call.
@@ -2270,29 +2786,69 @@ impl<'a> IntoIterator for &'a BlockIndexMap {
 /// entry -- and build the page index at the closing construction, where the sibling it needs is in
 /// hand. This impl then stays as the standalone door, for deserializing a bare map, which is the
 /// same two-doors-one-body shape the install and the written key already have.
-impl FromIterator<BlockIndex> for BlockIndexMap {
-    fn from_iter<I: IntoIterator<Item = BlockIndex>>(pages: I) -> Self {
+/// COLLECTED FROM (IDENTITY, PAGE) PAIRS, NOT FROM PAGES.
+///
+/// The handle is hashed from the identity and the page, and the identity is leaving the page --
+/// so the pair is what this can be built from once it has. Every producer of these pairs has the
+/// key in scope already: the decode has it in the stored map key it is iterating, and the
+/// fixtures have it in the page they just built.
+impl FromIterator<(Arc<str>, BlockIndex)> for BlockIndexMap {
+    fn from_iter<I: IntoIterator<Item = (Arc<str>, BlockIndex)>>(pages: I) -> Self {
         // Unaccounted: this is how a ShardState arrives from serde, and the tally is derived
         // AFTER a load by `reconcile_block_slab_live`. Charging blocks here would count a loaded
         // index twice over -- once on the way in, once when the load seeds the tally.
         let mut map = Self::default();
-        for page in pages {
-            let handle = block_index_handle(&page);
+        for (object_key, page) in pages {
+            let handle = block_index_handle(&object_key, &page);
             map.insert_unaccounted(handle, page);
         }
         map
     }
 }
 
-impl From<BTreeMap<String, BlockIndex>> for BlockIndexMap {
-    fn from(flat: BTreeMap<String, BlockIndex>) -> Self {
-        // The handle is recomputed from the block, not read from the file and not assigned by a
-        // counter. A counter would hand out different handles than the ones the lookup refs were
-        // written with, and those refs are on disk too.
-        //
-        // Built through `insert`, so a loaded index takes the same shape a written one does: a
-        // bucket that loads a single block must not come back holding a map.
-        flat.into_values().collect()
+/// THE PAGE INDEX A STORED BUCKET DECODES TO, AND BESIDE IT WHAT EACH PAGE'S IDENTITY IS.
+///
+/// The map is keyed by a HANDLE, and the handle is hashed from the identity and the page -- so a
+/// decode that cannot see an identity cannot even assign the key it files a page under. The
+/// identity is read here from the entry, which still carries one; what matters is that it is read
+/// ONCE, in one place, and handed both to the handle and to the caller.
+///
+/// WHY THE CALLER NEEDS IT. `object_block_lookup` is keyed by (kind, object key) and valued by the
+/// `(routing_bucket, handle)` of each of that object's pages. It is `skip_serializing` and was
+/// rebuilt after every load by walking the decoded entries and reading the identity off each --
+/// which is a walk that stops being possible the moment the entry has none. Handed up from here
+/// it is filed as the index decodes, from the only pass that ever has both the identity and the
+/// handle in scope.
+///
+/// Built through the same install as a live write, so a loaded index takes the shape a written one
+/// does: a bucket that loads a single block must not come back holding a list.
+///
+/// UNACCOUNTED, as it always was: this is how a `ShardState` arrives from serde and the live tally
+/// is derived AFTER a load by `reconcile_block_slab_live`. Charging here would count a loaded index
+/// twice over.
+fn page_index_and_identities(
+    flat: BTreeMap<String, StoredPageEntry>,
+) -> (BlockIndexMap, Vec<(u64, Arc<str>)>) {
+    let mut map = BlockIndexMap::default();
+    let mut identities = Vec::with_capacity(flat.len());
+    for stored in flat.into_values() {
+        // READ ONCE, FROM THE ONE PLACE THAT STILL HAS IT, and handed both to the handle and to
+        // the caller. The key is MOVED out of the stored entry rather than cloned off it.
+        let (object_key, page) = stored.into_parts();
+        let handle = block_index_handle(&object_key, &page);
+        map.insert_unaccounted(handle, page);
+        identities.push((handle, object_key));
+    }
+    (map, identities)
+}
+
+/// THE FIXTURE DOOR onto the same builder, for the bare maps that decode with no node around them.
+///
+/// It discards the identities because it has nobody to hand them to. One implementation and two
+/// doors; two builders that agree today is the hazard this file keeps a record of.
+impl From<BTreeMap<String, StoredPageEntry>> for BlockIndexMap {
+    fn from(flat: BTreeMap<String, StoredPageEntry>) -> Self {
+        page_index_and_identities(flat).0
     }
 }
 
@@ -2313,53 +2869,360 @@ impl From<BTreeMap<String, BlockIndex>> for BlockIndexMap {
 /// before a byte is written. And the sort is not incidental: the map this used to convert into was
 /// keyed by the rendered string and emitted entries in string order, while this map is keyed by a
 /// handle and iterates in hash order, so writing them as they come would reorder every dump.
-struct PageIndexAt<'a>(&'a BucketNode);
+struct PageIndexAt<'a> {
+    node: &'a BucketNode,
+    keys: &'a PageKeysByPosition<'a>,
+}
 
 impl Serialize for PageIndexAt<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serialize_page_index(&self.0.block_index, serializer)
+        serialize_page_index(self.node, self.keys, serializer)
     }
 }
 
-/// THE ONE IMPLEMENTATION both doors go through.
+/// THE ENTRY AS IT REACHES THE WIRE, WITH ITS IDENTITY INJECTED FROM BESIDE IT.
 ///
-/// A free function rather than a body inside `PageIndexAt`, because the fixtures serialize a bare
-/// map with no node around it and would otherwise need a second body. Two doors over one
-/// implementation is the shape; two implementations that agree today is the hazard this change is
-/// deleting on the handle side, and it would be absurd to introduce it on this one.
-fn serialize_page_index<S>(map: &BlockIndexMap, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeMap;
-    let mut entries: Vec<(String, &BlockIndex)> = map
-        .values()
-        .map(|page| (block_index_written_key(page), page))
-        .collect();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut serialized = serializer.serialize_map(Some(entries.len()))?;
-    for (key, page) in &entries {
-        serialized.serialize_entry(key, page)?;
-    }
-    serialized.end()
+/// `BlockIndex` no longer derives `Serialize`, for one reason: `object_key` is a SERIALIZED MEMBER
+/// and a derive can only read it off the entry. This writes the same five keys, in the same order,
+/// with the same names -- `object_key`, `model_id`, `address`, `dirty`, `deleted` -- taking the
+/// first from the caller and the rest from the page.
+///
+/// THE KEY SET IS OBSERVED, NOT READ OFF THE ATTRIBUTES.
+/// `page_entry_names::capture_the_stored_spelling_of_a_page_entry` prints a real encode of an
+/// entry and of a whole index; the five keys above are what it printed before this type existed
+/// and what it prints now.
+///
+/// THE FIELD COUNT IS PART OF THE ENCODING. The served index is msgpack `with_struct_map`, so
+/// `serialize_struct` writes a map header of exactly this length -- the same reason `BucketNode`
+/// counts its own optional key rather than hard-coding one.
+pub(super) struct PageEntryAt<'a> {
+    pub(super) page: &'a BlockIndex,
+    pub(super) object_key: &'a str,
 }
 
-/// TEST-ONLY DOOR onto the same implementation, for fixtures that hold a map and no node.
+/// THE ENTRY AS IT ARRIVES FROM THE WIRE, WITH THE IDENTITY STILL BESIDE IT.
 ///
-/// Production serializes a page index only through [`PageIndexAt`], from the bucket level. This
-/// exists so the six fixtures that write a bare map keep working without a second body for them to
-/// drift against.
-#[cfg(test)]
-impl Serialize for BlockIndexMap {
+/// The counterpart of [`PageEntryAt`], and it exists for a sharper reason than symmetry. A derived
+/// `Deserialize` on `BlockIndex` keeps COMPILING once `object_key` is not a field: serde's derive
+/// ignores a key it has no field for unless `deny_unknown_fields` is set. So the removal would
+/// have taken the identity off the load path without a single error, and `object_block_lookup` --
+/// `skip_serializing`, rebuilt from what the decode reads -- would have come back empty on every
+/// load. That is the exact state the encoder refuses to write.
+///
+/// THE FIVE FIELDS ARE THE DERIVE'S, UNCHANGED AND UNATTRIBUTED. `BlockIndex` carried no
+/// `#[serde(default)]` and no `rename`, so all five keys are required and spelled as declared;
+/// adding an attribute here would be a stored-format change wearing a refactor's clothes.
+/// `page_entry_names::an_index_written_before_this_change_loads_page_for_page` is what drives it.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct StoredPageEntry {
+    pub(super) object_key: Arc<str>,
+    pub(super) model_id: crate::engine::storage_bucket_internals::StoredModelKind,
+    pub(super) address: ElementEntry,
+    pub(super) dirty: bool,
+    pub(super) deleted: bool,
+}
+
+impl StoredPageEntry {
+    /// The identity, and the entry that no longer holds it.
+    ///
+    /// Taken apart by VALUE so the shared pointer moves rather than being cloned: every caller
+    /// keeps the key -- the filing map and the identities handed up to the decode both do -- so
+    /// this has to go on costing one pointer and not a copy of the characters.
+    pub(super) fn into_parts(self) -> (Arc<str>, BlockIndex) {
+        let StoredPageEntry {
+            object_key,
+            model_id,
+            address,
+            dirty,
+            deleted,
+        } = self;
+        let page = BlockIndex {
+            // STILL ASSIGNED, AND THIS LINE GOES WITH THE FIELD. The entry holds a copy for one
+            // more commit; the pointer is cloned rather than moved precisely so the identity is
+            // handed back as well, which is the half the load path needs.
+            object_key: Arc::clone(&object_key),
+            model_id,
+            address,
+            dirty,
+            deleted,
+        };
+        (object_key, page)
+    }
+}
+
+impl Serialize for PageEntryAt<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serialize_page_index(self, serializer)
+        use serde::ser::SerializeStruct;
+        // NAMED `BlockIndex`, which is what the derive named it. A `serialize_struct` name reaches
+        // some formats and not others, and this one must not move either.
+        let mut entry = serializer.serialize_struct("BlockIndex", 5)?;
+        // AN `&str` WHERE THE DERIVE WROTE AN `Arc<str>`, which is the same bytes: serde's impl
+        // for `Arc<T>` forwards to `T`, and `str` writes a string.
+        entry.serialize_field("object_key", self.object_key)?;
+        entry.serialize_field("model_id", &self.page.model_id)?;
+        entry.serialize_field("address", &self.page.address)?;
+        entry.serialize_field("dirty", &self.page.dirty)?;
+        entry.serialize_field("deleted", &self.page.deleted)?;
+        entry.end()
+    }
+}
+
+/// EVERY PAGE THIS BUCKET WRITES, NAMED BY THE IDENTITY HELD BESIDE IT.
+///
+/// # THE SOURCE IS BESIDE THE PAGE NOW, AND A MISSING ONE IS REFUSED
+///
+/// This was a CHECK (`check_page_keys_against_their_siblings`) walking the bucket a second time
+/// and comparing the key the entry's own copy composes against the key the neighbour composes. It
+/// is the SOURCE now: the written key below is composed from the neighbour, and the entry's copy
+/// is only still compared because it still exists. One walk rather than two, because a check that
+/// has become a source cannot usefully be a separate pass over the same pages.
+///
+/// A PAGE WITH NO IDENTITY BESIDE IT IS A REFUSAL, NOT A SKIP, AND THAT IS A BEHAVIOUR CHANGE ON
+/// THE DURABILITY PATH. The skip that stood here was excused by `names_no_position()` -- the
+/// decode-then-rebuild window, where a page legitimately has nothing beside it. That hatch excused
+/// two states and not one: the legitimate window, and an encoder handed a lookup that does not
+/// cover the bucket it is writing. With the identity off the entry the second writes a key naming
+/// NOTHING, silently, once per page, and returns `Ok`. A dump therefore goes from "succeeds,
+/// having written a key naming nothing" to "refuses", and `names_no_position()` is what the
+/// refusal says to tell the two apart rather than what excuses either.
+///
+/// UNDER A PLANTED EMPTY INVERSION ALL 29 TOMBSTONE TESTS STILL PASSED, which is what says the
+/// hatch was load-bearing in the wrong direction: nothing in the suite could tell an encode with
+/// no source from an encode with one.
+///
+/// # WHAT MAKES THE REFUSAL UNREACHABLE: THE FILING SITES, NOT AN ARGUMENT
+///
+/// The lookup is `skip_serializing` and is filed as pages are placed, at every site that places
+/// one. `insert_object_block_lookup` has ELEVEN production callers -- `state.rs` at the decode
+/// (`CoreIndex`'s visitor, from the `page_keys` the decode hands up), at
+/// `CoreIndex::insert_page_for_bucket` and at two rebuild sites; `storage_bucket_internals.rs` at
+/// six (the publish establish, the batch fold, the two reconstructs, the whole-shard rebuild and
+/// the bucket-first rebuild); and `engine.rs` at one. Between them and the hand-written
+/// `impl Default for CoreIndex` -- which starts the ref total at `Some(0)` rather than `None`, so
+/// a count can be incremented into a right answer -- there is no site at which a page is placed
+/// and not filed.
+///
+/// MEASURED RATHER THAN ARGUED: 630 encodes with pages, ZERO unnamed pages and ZERO empty
+/// inversions, with the instrument proved able to fire -- a planted empty inversion turned twelve
+/// encodes into twelve and eighty-four.
+///
+/// # THE CHECK THIS REPLACES COMPARED NO DELETED PAGE, AND IT WAS MEASURED DOING SO
+///
+/// It lived inside the encoder, drew only on the object lookup, and `continue`d whenever the
+/// lookup did not name a page. A tombstone is NEVER in that lookup --
+/// `insert_object_block_lookup` returns early on a deleted page -- so the skip was unconditional
+/// for the whole deleted class and the comparison could not reach it.
+///
+/// COUNTED RATHER THAN REASONED. Instrumented over the hundred dump tests, the old check compared
+/// 1,998,922 pages and 0 of them were deleted, while the encoder was reached by deleted pages 7
+/// times under `tombstone` and 3 under `container_tombstone`. The denominator on the class the
+/// swap depends on was zero, so zero disagreements said nothing about it.
+///
+/// # SO THERE ARE TWO SOURCES BESIDE A PAGE AND NOT ONE
+///
+/// A LIVE page has its identity in the object lookup, inverted by position. A DELETED page has
+/// its own in this bucket's tombstone rows, which are keyed by the page triple and carry the
+/// object key and the kind -- the two terms the stored spelling is composed from. Measured over
+/// `tombstone`, `container_tombstone` and `reload`: 245 deleted pages reached the encoder and all
+/// 245 had an agreeing row, with no disagreement and no row missing.
+///
+/// # AND A MISSING SOURCE IS NOW REFUSED UNLESS THE LOOKUP IS UNESTABLISHED
+///
+/// That window is real -- an index decoded and not yet rebuilt has an empty lookup, which is
+/// where the two live pages measured without a source both came from -- and it is the one state
+/// in which a page legitimately has nothing beside it. Naming it is what stops the skip from
+/// covering the case the identity's move would break.
+/// THE ONE IMPLEMENTATION, AND THERE IS ONE DOOR ONTO IT.
+///
+/// It took a bare `&BlockIndexMap` and took the identity off each entry, which is why a second
+/// door -- `#[cfg(test)] impl Serialize for BlockIndexMap` -- could exist at all. It takes the
+/// NODE now, because that is what the two identity sources live beside: the object lookup inverted
+/// by position for a live page, and this bucket's own tombstone rows for a deleted one. The
+/// test-only door is gone with it, and it had NO CALLERS either.
+///
+/// THE SORT IS NOT INCIDENTAL. The map this used to convert into was keyed by the rendered string
+/// and emitted entries in string order, while this map is keyed by a handle and iterates in hash
+/// order, so writing them as they come would reorder every dump.
+fn serialize_page_index<'k, S>(
+    node: &'k BucketNode,
+    keys: &PageKeysByPosition<'k>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::{Error as _, SerializeMap};
+    let mut entries: Vec<(String, PageEntryAt<'_>)> =
+        Vec::with_capacity(node.block_index.len());
+    for (handle, page) in node.block_index.iter() {
+        // THROUGH THE ONE DOOR, so the encoder and the readers cannot disagree about where an
+        // identity comes from.
+        let Some(beside) = keys.identity_of(node, *handle, page) else {
+            return Err(S::Error::custom(format!(
+                "bucket {} holds a page whose stored key would name no object, so this index is \
+                 not writable: deleted={}, and the inversion {}",
+                node.routing_bucket,
+                page.deleted,
+                if keys.names_no_position() {
+                    "names NO position at all, so this is the decode-then-rebuild window and the \
+                     encode was taken inside it"
+                } else {
+                    "DOES name positions, so the encoder was handed a lookup that does not cover \
+                     this bucket"
+                },
+            )));
+        };
+        // THE TIE BACK TO THE ENTRY'S OWN COPY, FOR AS LONG AS THE ENTRY STILL HOLDS ONE.
+        //
+        // This is what says the bytes did not move: the key written below is composed from the
+        // neighbour, and this asserts character-for-character that the entry's own copy composes
+        // the same one. It compares the MODEL term too, which `block_index_written_key` reads off
+        // the page -- so a neighbour that disagrees about either half fails here. It goes when the
+        // field does, because there will be nothing left to compare.
+        debug_assert_eq!(
+            block_index_written_key(&page.object_key, page),
+            crate::index_log::block_ref_key_from_parts(
+                beside.model_id,
+                beside.object_key,
+                None,
+                page.address.block_slab_id(),
+                page.address.offset(),
+                page.address.length(),
+                page.address.block_id().unwrap_or_default(),
+                page.address.generation().unwrap_or_default(),
+            ),
+            "the identity held BESIDE the page must compose the same stored key as the identity \
+             held ON it, or moving the identity off the entry would move the bytes"
+        );
+        entries.push((
+            block_index_written_key(beside.object_key, page),
+            PageEntryAt { page, object_key: beside.object_key },
+        ));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut serialized = serializer.serialize_map(Some(entries.len()))?;
+    for (key, entry) in &entries {
+        serialized.serialize_entry(key, entry)?;
+    }
+    serialized.end()
+}
+
+/// THE PAGE INDEX KEYED FROM THE ENTRIES' OWN COPIES OF THE IDENTITY -- A SCAFFOLD, AND TESTS ONLY.
+///
+/// # WHY A SECOND IMPLEMENTATION EXISTS AT ALL, WHICH THIS FILE OTHERWISE REFUSES
+///
+/// Twenty-six test arms encode a bare `BucketNode` or a bare `BlockIndexMap` and assert something
+/// about the BYTES: that two fillings of the same pages agree, that a flag state survives the
+/// wire, that a budget is what it was. None of them has an object lookup, because none of them has
+/// a `CoreIndex`; the identity they can name is the one on the entry.
+///
+/// It is `#[cfg(test)]` and it is named rather than reached through an `Option`, which is the
+/// difference that matters: the keyless case used to be a `None` any caller could pass, and is now
+/// a type production cannot construct. `--lib` compiles with no `Serialize for BucketNode` and no
+/// `Serialize for BlockIndexMap` in it at all.
+///
+/// # IT STOPPED READING THE ENTRY, AND THE FIXTURE NAMES THE OBJECTS INSTEAD
+///
+/// It was `PageIndexFromTheEntriesOwnCopies`, and it keyed each page from the entry's own copy of
+/// the identity -- which is the copy that is going. A bare node has no object lookup to invert,
+/// so the only remaining source for a page's object is the FIXTURE, and the fixture is handed in.
+///
+/// WHAT IS HANDED IN IS THE OBJECT KEYS, NOT A HANDLE MAP, and the match is the map's own. A page
+/// is filed under `block_index_handle(object_key, page)`, so for each page exactly one of the
+/// named objects reproduces the handle it is filed under. The caller writes the string literals
+/// its own fixture wrote -- usually one -- and this recomputes the pairing rather than being told
+/// it. A wrong literal does not quietly key a page under the wrong name: it matches nothing.
+///
+/// A PAGE NO NAMED OBJECT ACCOUNTS FOR IS A PANIC, and so is a list with an object that accounts
+/// for no page. The first is the hole this door exists to close -- the keyless encode that wrote
+/// a key naming nothing, once per page, and returned `Ok`. The second is a stale list, which is
+/// how this kind of hand-written argument rots: a fixture that stops writing an object and leaves
+/// its name here would otherwise go on passing.
+#[cfg(test)]
+pub(super) struct PageIndexNamedBy<'a>(pub(super) &'a BlockIndexMap, pub(super) &'a [&'a str]);
+
+#[cfg(test)]
+impl PageIndexNamedBy<'_> {
+    /// The object each page is filed under, matched by the handle the map keyed it with.
+    fn pairs(&self) -> Vec<(&str, &BlockIndex)> {
+        let mut used = vec![false; self.1.len()];
+        let paired: Vec<(&str, &BlockIndex)> = self
+            .0
+            .iter()
+            .map(|(handle, page)| {
+                let at = self
+                    .1
+                    .iter()
+                    .position(|object| block_index_handle(object, page) == *handle)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no object named by this fixture is filed at handle {handle}; the                              named objects are {:?}",
+                            self.1
+                        )
+                    });
+                used[at] = true;
+                (self.1[at], page)
+            })
+            .collect();
+        if let Some(at) = used.iter().position(|hit| !hit) {
+            panic!(
+                "this fixture names the object {:?}, which accounts for none of the {} page(s)                  in the map; a name left behind by a fixture that stopped writing it would go on                  passing",
+                self.1[at],
+                paired.len()
+            );
+        }
+        paired
+    }
+}
+
+#[cfg(test)]
+impl Serialize for PageIndexNamedBy<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut entries: Vec<(String, PageEntryAt<'_>)> = self
+            .pairs()
+            .into_iter()
+            .map(|(object_key, page)| {
+                (
+                    block_index_written_key(object_key, page),
+                    PageEntryAt { page, object_key },
+                )
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut serialized = serializer.serialize_map(Some(entries.len()))?;
+        for (key, entry) in &entries {
+            serialized.serialize_entry(key, entry)?;
+        }
+        serialized.end()
+    }
+}
+
+/// TEST-ONLY DOOR for the arms that write a bare NODE, with the objects its fixture wrote.
+#[cfg(test)]
+pub(super) struct NodeNamedBy<'a>(pub(super) &'a BucketNode, pub(super) &'a [&'a str]);
+
+#[cfg(test)]
+impl Serialize for NodeNamedBy<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_bucket_node(
+            self.0,
+            &PageIndexNamedBy(&self.0.block_index, self.1),
+            serializer,
+        )
     }
 }
 
@@ -2376,11 +3239,14 @@ impl Serialize for BlockIndexMap {
 /// Hashes exactly the fields [`block_index_written_key`] renders, so the handle and the written
 /// key always name the same block. Equal identity therefore lands on one slot, which is also how
 /// this map keeps a rewrite from accumulating a second entry for the same block.
-pub(super) fn block_index_handle(page: &BlockIndex) -> u64 {
+pub(super) fn block_index_handle(object_key: &str, page: &BlockIndex) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     page.model_id.hash(&mut hasher);
-    page.object_key.hash(&mut hasher);
+    // THE IDENTITY ARRIVES AS A PARAMETER. It was read off the entry, which is the one place it
+    // is about to stop being. Same bytes into the same hasher in the same order, so the handle
+    // is unchanged -- what moves is WHERE the caller gets the key, and every caller has one.
+    object_key.hash(&mut hasher);
     // STILL HASHED, AND SEVERAL PRODUCERS NOW FILE IT AS `None`.
     //
     // RESTATED FROM "ONE PRODUCER", which was the set arm alone. Every kind
@@ -2413,10 +3279,10 @@ pub(super) fn block_index_handle(page: &BlockIndex) -> u64 {
     hasher.finish()
 }
 
-pub(super) fn block_index_written_key(page: &BlockIndex) -> String {
+pub(super) fn block_index_written_key(object_key: &str, page: &BlockIndex) -> String {
     crate::index_log::block_ref_key_from_parts(
         page.model_id.as_str(),
-        &page.object_key,
+        object_key,
         // `None`, WHICH IS WHAT THIS ALREADY PASSED. The STORED spelling of a page's key is built
         // here, so the value must not move: every entry's component was `None` before the field was
         // removed, and passing the constant keeps every written key character-for-character what it
@@ -3728,11 +4594,22 @@ impl BucketNode {
     /// which is what a term moved off the entry into a per-bucket structure would need, and what
     /// `BlockIndexMap` can never offer, since a field cannot see its siblings.
     ///
-    /// It banks nothing today: `block_index_handle` reads the same terms off the entry it always
-    /// did, in the same order, through the same hasher, so the value is byte-identical. What
-    /// changes is that the computation is no longer pinned to a scope that can only see the entry.
-    pub(super) fn insert_page(&mut self, page: BlockIndex, live: &mut BlockSlabLiveIndex) -> u64 {
-        let handle = block_index_handle(&page);
+    /// It banks nothing today: `block_index_handle` reads the same terms it always did, in the
+    /// same order, through the same hasher, so the value is byte-identical. What changes is that
+    /// the computation is no longer pinned to a scope that can only see the entry.
+    ///
+    /// THE IDENTITY ARRIVES AS A PARAMETER, for the same reason the four derivations in
+    /// `070f24334` take it: it is leaving the entry, and a handle computed from
+    /// `page.object_key` is a handle no caller can supply once the field is gone. Same bytes into
+    /// the same hasher in the same order, so every handle is byte-identical; what moves is where
+    /// the key comes from.
+    pub(super) fn insert_page(
+        &mut self,
+        object_key: &str,
+        page: BlockIndex,
+        live: &mut BlockSlabLiveIndex,
+    ) -> u64 {
+        let handle = block_index_handle(object_key, &page);
         self.block_index.insert_with_handle(handle, page, live)
     }
 
@@ -3740,8 +4617,8 @@ impl BucketNode {
     ///
     /// One caller, and it must stay that way -- see
     /// [`BlockIndexMap::insert_released_with_handle`].
-    pub(super) fn insert_released_page(&mut self, page: BlockIndex) -> u64 {
-        let handle = block_index_handle(&page);
+    pub(super) fn insert_released_page(&mut self, object_key: &str, page: BlockIndex) -> u64 {
+        let handle = block_index_handle(object_key, &page);
         self.block_index.insert_released_with_handle(handle, page)
     }
 
@@ -3928,39 +4805,65 @@ impl BucketNode {
 /// A repeated key is an error rather than a last-one-wins, exactly as the derive had it: two
 /// disagreeing statements of the same fact must fail loudly and before anything is built from
 /// them.
-impl Serialize for BucketNode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
+// THE BLANKET FIXTURE DOORS ARE GONE, AND THAT IS THE POINT RATHER THAN A TIDY-UP.
+//
+// `#[cfg(test)] impl Serialize for BucketNode` and the matching one for `BlockIndexMap` let a
+// test write `serde_json::to_string(&node)` and get bytes whose page keys were composed from the
+// entries' own copies of the identity. With that copy gone the only thing such an impl could
+// compose is a key naming nothing, once per page, returned as `Ok` -- and an inherent impl on the
+// type is reachable from anywhere in the test tree, so nothing would ask the caller for the
+// identity it means.
+//
+// [`NodeNamedBy`] and [`PageIndexNamedBy`] replace them. They are wrappers, so every one of the
+// twenty-six arms now states the objects its fixture wrote, and the compiler asked each of them
+// to. Their doc carries why the objects are matched by handle rather than listed per page.
+
+/// THE BODY EVERY NODE DOOR GOES THROUGH, PARAMETERISED ON HOW THE PAGE INDEX IS WRITTEN.
+///
+/// The page index used to be composed inside this function from an `Option` context, which is
+/// what let the keyless case exist. It arrives as a value that already knows how to write itself,
+/// so there is one body, no `Option`, and exactly two things that can be passed: the production
+/// [`PageIndexAt`], which is handed the identity from beside each page, and the `#[cfg(test)]`
+/// [`PageIndexFromTheEntriesOwnCopies`], which is not reachable from production code.
+fn serialize_bucket_node<S, P>(
+    node_ref: &BucketNode,
+    page_index: &P,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    P: Serialize,
+{
     {
+        let self_ = node_ref;
         use serde::ser::SerializeStruct;
         // THE COUNT IS PART OF THE ENCODING, not a hint. The served index is msgpack
         // `with_struct_map`, so `serialize_struct` writes a MAP HEADER of exactly this length --
         // a node that then writes a thirteenth field under a header of twelve is corrupt bytes,
         // not a tolerated mismatch. So the optional key below is counted here rather than
         // hard-coded, and the two cannot disagree.
-        let field_count = 12 + usize::from(!self.tombstone_elements.is_empty());
+        let field_count = 12 + usize::from(!self_.tombstone_elements.is_empty());
         let mut node = serializer.serialize_struct("BucketNode", field_count)?;
-        node.serialize_field("routing_slot", &self.routing_bucket)?;
-        node.serialize_field("layout", &self.layout)?;
-        node.serialize_field("dirty", &self.dirty())?;
-        node.serialize_field("deleted", &self.deleted())?;
-        node.serialize_field("meta_loaded", &self.meta_loaded())?;
-        node.serialize_field("loading", &self.loading())?;
-        node.serialize_field("in_memory", &self.in_memory())?;
-        node.serialize_field("ttl_ms", &self.ttl_ms)?;
-        node.serialize_field("dirty_generation", &self.dirty_generation)?;
-        node.serialize_field("object_index", &self.object_index)?;
-        node.serialize_field("deleted_object_index", &self.deleted_object_index)?;
+        node.serialize_field("routing_slot", &self_.routing_bucket)?;
+        node.serialize_field("layout", &self_.layout)?;
+        node.serialize_field("dirty", &self_.dirty())?;
+        node.serialize_field("deleted", &self_.deleted())?;
+        node.serialize_field("meta_loaded", &self_.meta_loaded())?;
+        node.serialize_field("loading", &self_.loading())?;
+        node.serialize_field("in_memory", &self_.in_memory())?;
+        node.serialize_field("ttl_ms", &self_.ttl_ms)?;
+        node.serialize_field("dirty_generation", &self_.dirty_generation)?;
+        node.serialize_field("object_index", &self_.object_index)?;
+        node.serialize_field("deleted_object_index", &self_.deleted_object_index)?;
         // AT THE BUCKET LEVEL, through `PageIndexAt`, so the written key is composed where the
         // node's other structures are in scope. The bytes are the ones the map's own impl wrote.
-        node.serialize_field("page_index", &PageIndexAt(self))?;
+        node.serialize_field("page_index", page_index)?;
         // THE ELEMENT EACH TOMBSTONE IN THIS BUCKET IS ABOUT, which the entries themselves no
         // longer say. Written LAST so the key is appended to the shape rather than inserted into
         // the middle of it, and `skip_serializing_if` keeps it off every bucket that has never had
         // a removal -- which is almost all of them, so the ordinary node's bytes do not move.
-        if !self.tombstone_elements.is_empty() {
-            node.serialize_field("tombstone_elements", &self.tombstone_elements)?;
+        if !self_.tombstone_elements.is_empty() {
+            node.serialize_field("tombstone_elements", &self_.tombstone_elements)?;
         }
         node.end()
     }
@@ -4059,7 +4962,30 @@ impl<'de> Deserialize<'de> for BucketNodeField {
     }
 }
 
+/// A DECODED NODE AND THE IDENTITY OF EVERY PAGE IN IT.
+///
+/// The pair exists because serde hands a `Deserialize` impl no context and lets it return only
+/// `Self`: a node's decoder cannot reach the index's `object_block_lookup`, and the index's
+/// decoder cannot see inside a node's page index. What travels between them is this.
+///
+/// The same shape as `BucketNodeAt` on the encode side, for the same reason and in the other
+/// direction.
+pub(super) struct BucketNodeWithPageKeys {
+    pub(super) node: BucketNode,
+    pub(super) page_keys: Vec<(u64, Arc<str>)>,
+}
+
+/// THE FIXTURE DOOR: a node on its own, with its page identities dropped.
 impl<'de> Deserialize<'de> for BucketNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(BucketNodeWithPageKeys::deserialize(deserializer)?.node)
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketNodeWithPageKeys {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -4067,13 +4993,13 @@ impl<'de> Deserialize<'de> for BucketNode {
         struct NodeVisitor;
 
         impl<'de> serde::de::Visitor<'de> for NodeVisitor {
-            type Value = BucketNode;
+            type Value = BucketNodeWithPageKeys;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a bucket node")
             }
 
-            fn visit_map<M>(self, mut map: M) -> Result<BucketNode, M::Error>
+            fn visit_map<M>(self, mut map: M) -> Result<BucketNodeWithPageKeys, M::Error>
             where
                 M: serde::de::MapAccess<'de>,
             {
@@ -4093,7 +5019,11 @@ impl<'de> Deserialize<'de> for BucketNode {
                 let mut last_dump_sequence: Option<u64> = None;
                 let mut object_index: Option<ObjectIndex> = None;
                 let mut deleted_object_index: Option<DeletedObjectIndex> = None;
-                let mut block_index: Option<BlockIndexMap> = None;
+                // DECODED FLAT, and that is the change. It was `Option<BlockIndexMap>`, which
+                // threw the stored map's keys away inside the conversion; the page identities have
+                // to come out of this decode, so the flat form is what is held and the conversion
+                // happens where both halves can be kept.
+                let mut block_index: Option<BTreeMap<String, StoredPageEntry>> = None;
                 // DEFAULTS WHEN ABSENT, and that is not a compatibility affordance: an index
                 // written before this key existed is REFUSED by its stamp before it reaches here
                 // (`persistence` compares `<` and falls back to WAL replay), so the only node that
@@ -4173,23 +5103,29 @@ impl<'de> Deserialize<'de> for BucketNode {
                     in_memory.ok_or_else(|| M::Error::missing_field("in_memory"))?,
                 );
 
-                Ok(BucketNode {
-                    routing_bucket: routing_bucket
-                        .ok_or_else(|| M::Error::missing_field("routing_slot"))?,
-                    layout: layout.unwrap_or_default(),
-                    flags,
-                    ttl_ms: ttl_ms.unwrap_or_default(),
-                    dirty_generation: dirty_generation
-                        .ok_or_else(|| M::Error::missing_field("dirty_generation"))?,
-                    // Transient by declaration: a load clears every dirty flag, so a reloaded
-                    // bucket holds no claim over either log and these start at 0 whatever the
-                    // stored index says.
-                    first_dirty_wal_sequence: 0,
-                    first_dirty_index_log_sequence: 0,
-                    object_index: object_index.unwrap_or_default(),
-                    deleted_object_index: deleted_object_index.unwrap_or_default(),
-                    block_index: block_index.unwrap_or_default(),
-                    tombstone_elements: tombstone_elements.unwrap_or_default(),
+                let (block_index, page_keys) =
+                    page_index_and_identities(block_index.unwrap_or_default());
+
+                Ok(BucketNodeWithPageKeys {
+                    node: BucketNode {
+                        routing_bucket: routing_bucket
+                            .ok_or_else(|| M::Error::missing_field("routing_slot"))?,
+                        layout: layout.unwrap_or_default(),
+                        flags,
+                        ttl_ms: ttl_ms.unwrap_or_default(),
+                        dirty_generation: dirty_generation
+                            .ok_or_else(|| M::Error::missing_field("dirty_generation"))?,
+                        // Transient by declaration: a load clears every dirty flag, so a reloaded
+                        // bucket holds no claim over either log and these start at 0 whatever the
+                        // stored index says.
+                        first_dirty_wal_sequence: 0,
+                        first_dirty_index_log_sequence: 0,
+                        object_index: object_index.unwrap_or_default(),
+                        deleted_object_index: deleted_object_index.unwrap_or_default(),
+                        block_index,
+                        tombstone_elements: tombstone_elements.unwrap_or_default(),
+                    },
+                    page_keys,
                 })
             }
         }
@@ -4208,28 +5144,22 @@ pub(super) enum BucketLayoutState {
     MultiObject,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// NEITHER HALF OF SERDE IS ON THIS DERIVE ANY MORE, AND THAT IS THE STEP.
+//
+// `object_key` is a SERIALIZED MEMBER of the stored entry, so a derive on this struct is a derive
+// that reads the identity off the entry -- the one place it is about to stop being. The entry
+// reaches the wire through [`PageEntryAt`] instead, which is handed the identity from BESIDE the
+// page and writes the same five keys in the same order.
+//
+// AND IT ARRIVES THROUGH [`StoredPageEntry`], FOR THE MIRROR-IMAGE REASON. A derived
+// `Deserialize` would go on compiling with the field gone -- serde IGNORES an unknown key on a
+// derived struct unless `deny_unknown_fields` is set -- and would silently drop the one term the
+// load path cannot do without. `object_block_lookup` is `skip_serializing` and is rebuilt from
+// what the decode reads, so an `object_key` quietly discarded here is an index that loads with no
+// lookup, which is the state the encoder now refuses to write. The stored form still CARRIES the
+// key; what changes is that the thing it is read into is not the entry.
+#[derive(Debug, Clone)]
 pub(super) struct BlockIndex {
-    /// LOG-ONLY, and SKIPPED on the named side: a resident entry is always a page.
-    ///
-    /// `skip` fills from `Default`, which is safe here only because `index_log`'s
-    /// `impl Default for IndexItemKind` is HAND-WRITTEN and returns `Page`. The named
-    /// round-trip test asserts that default, so a derive swap or an enum reorder goes
-    /// red instead of silently relabelling every decoded entry under a decoder that
-    /// refuses nothing.
-    #[serde(skip)]
-    pub(super) kind: crate::index_log::IndexItemKind,
-    /// LOG-ONLY, and SKIPPED on the named side because the NODE already names it.
-    ///
-    /// NOT a plain `skip`: `Default` is 0 and ZERO IS A LEGAL BUCKET, so skipping it
-    /// alone would fold every entry into bucket zero -- silently, because the named
-    /// decoder refuses nothing. `BucketNode`'s visitor INJECTS the node's own bucket
-    /// into each entry at its closing construction, where both are in scope, so this
-    /// never rides the named wire and cannot disagree with the node it is filed under.
-    /// That makes it the free-to-recompute kind of redundancy rather than the kind
-    /// that is stored so a reader answers with no I/O.
-    #[serde(skip)]
-    pub(super) routing_bucket: u32,
     pub(super) object_key: Arc<str>,
     pub(super) model_id: crate::engine::storage_bucket_internals::StoredModelKind,
     pub(super) address: ElementEntry,
@@ -4342,21 +5272,28 @@ const _: () = assert!(std::mem::align_of::<BlockIndex>() == 8);
 // pair of claims it was built to hold apart: the SUM of the field widths is 40, and the TYPE
 // measures 40, neither inferred from the other.
 const _: () = {
-    let field_sum = std::mem::size_of::<crate::index_log::IndexItemKind>()   // kind
-        + std::mem::size_of::<u32>()                                         // routing_bucket
-        + std::mem::size_of::<Arc<str>>()                                    // object_key
+    let field_sum = std::mem::size_of::<Arc<str>>()                          // object_key
         + std::mem::size_of::<crate::engine::storage_bucket_internals::StoredModelKind>() // model_id
         + std::mem::size_of::<ElementEntry>()                                // address
         + std::mem::size_of::<bool>()                                        // dirty
         + std::mem::size_of::<bool>();                                       // deleted
-    // SPELLED AS TYPES, NOT AS THE LITERALS 1 AND 4 THIS USED TO CARRY. A hand-written `1` for
-    // `kind` goes on being right by luck if the enum grows a payload; read off the type it goes
-    // red here instead.
-    assert!(field_sum == 40);
+    // SPELLED AS TYPES, NOT AS LITERALS. A hand-written `1` for the model spelling goes on being
+    // right by luck if the enum grows a payload; read off the type it goes red here instead.
+    assert!(field_sum == 35);
     assert!(std::mem::size_of::<BlockIndex>() == (field_sum + 7) / 8 * 8);
-    // ZERO SLACK, asserted as the claim: the next field here costs EIGHT bytes. It survived the
-    // removal -- 40 is a multiple of 8, so the field set still packs exactly.
-    assert!(field_sum == std::mem::size_of::<BlockIndex>());
+    // THE WIDTH DID NOT MOVE, AND THIS BLOCK HAS TO SAY SO OR IT PASSES BY COINCIDENCE.
+    //
+    // Two fields left the entry and `size_of` is still FORTY. Thirty-five rounds up to forty, so
+    // the removal bought five bytes of slack and no width. That matters twice over: nobody should
+    // read the commit that removed them as the step that moved the number, and this block itself
+    // would have gone on passing untouched -- it reconstructed the sum from the two retired TYPES,
+    // which still exist, so it summed to forty and compared equal to a forty-byte struct. It was
+    // true of nothing and would not have failed. Restated rather than left standing.
+    //
+    // WHAT WOULD MOVE IT: the sixteen-byte shared pointer to the object key. Thirty-five minus
+    // sixteen is nineteen, which rounds to twenty-four.
+    assert!(std::mem::size_of::<BlockIndex>() == 40);
+    assert!(std::mem::size_of::<BlockIndex>() - field_sum == 5);
 };
 
 // WHAT THE ENTRY WOULD BE IF ITS ADDRESS FIELD HELD THE BARE WORD: THIRTY-TWO, MEASURED.
@@ -4442,17 +5379,13 @@ const _: () = {
 const _: () = {
     #[allow(dead_code)]
     struct TheEntryHoldingOneAddressWord {
-        kind: crate::index_log::IndexItemKind,
-        routing_bucket: u32,
         object_key: Arc<str>,
         model_id: crate::engine::storage_bucket_internals::StoredModelKind,
         address: crate::block_store::BlockAddress,
         dirty: bool,
         deleted: bool,
     }
-    let field_sum = std::mem::size_of::<crate::index_log::IndexItemKind>()
-        + std::mem::size_of::<u32>()
-        + std::mem::size_of::<Arc<str>>()
+    let field_sum = std::mem::size_of::<Arc<str>>()
         + std::mem::size_of::<crate::engine::storage_bucket_internals::StoredModelKind>()
         + std::mem::size_of::<crate::block_store::BlockAddress>()
         + std::mem::size_of::<bool>()
@@ -4473,18 +5406,33 @@ const _: () = {
     // not whether it can be taken.
     //
     // THE TWO NUMBERS THE STEP IS ABOUT, both asserted and neither inferred from the other.
-    assert!(field_sum == 32);
+    assert!(field_sum == 27);
     assert!(std::mem::size_of::<TheEntryHoldingOneAddressWord>() == 32);
-    // ZERO SLACK SURVIVES THE NARROWING: 32 is a multiple of eight, so the step is a whole word
-    // and not a word of field plus some rounding. It survived the element name's removal too --
-    // 48 and 32 are both multiples of eight -- so this identity is checked rather than restated.
-    assert!(std::mem::size_of::<TheEntryHoldingOneAddressWord>() == field_sum);
+    // AND THE SLACK IS FIVE, NOT ZERO -- RESTATED, BECAUSE THE PROBE WAS DESCRIBING TWO FIELDS
+    // THIS ENTRY NO LONGER HAS.
+    //
+    // It read "ZERO SLACK SURVIVES THE NARROWING: 32 is a multiple of eight, so the step is a
+    // whole word and not a word of field plus some rounding", and asserted it as
+    // `size_of::<probe>() == field_sum`. That was true of a probe carrying `kind` and
+    // `routing_bucket` -- 32 bytes of field in 32 -- and those two left `BlockIndex` in
+    // `65c7fc562`. Without them the probe holds TWENTY-SEVEN bytes of field in thirty-two.
+    //
+    // THE WIDTH DID NOT MOVE AND THAT IS WHY NOTHING FAILED. 32 and 27 both round to 32, so the
+    // width pin above went on passing and so did the tie below; what was false was the
+    // DECOMPOSITION, which is the half a width cannot check. The same shape is recorded against
+    // `entry_width_at_each_step`, where the step-zero control passed through the identical error
+    // and is now pinned by field OFFSETS for exactly that reason.
+    assert!(std::mem::size_of::<TheEntryHoldingOneAddressWord>() - field_sum == 5);
     // TIED TO `BlockIndex` ITSELF, so this cannot go on describing a type that moved. The real
     // entry must equal the probe plus exactly what the holder carries over the bare word.
     //
     // THE EXPRESSION IS UNCHANGED AND IT IS THE PROBE THAT MOVED. 32 + (16 - 8) is 40, which is
     // what the live entry measures; it was 48 + (16 - 8) = 56 against main's. So the tie did its
     // job twice over: it refused the merge, and it still holds with no term added to it.
+    //
+    // AND IT IS A TIE BETWEEN TWO WIDTHS, so it could not see the two retired fields either --
+    // the probe's width is 32 whether or not they are declared on it. Recorded here rather than
+    // left as an apparent success.
     assert!(
         std::mem::size_of::<BlockIndex>()
             == std::mem::size_of::<TheEntryHoldingOneAddressWord>()
@@ -4493,7 +5441,7 @@ const _: () = {
     );
 };
 
-// WHERE THIS LEG ENDS IF THE REMAINING NARROWINGS LAND: TWENTY OF FIELD IN TWENTY-FOUR.
+// WHERE THIS LEG ENDS IF THE REMAINING NARROWINGS LAND: FIFTEEN OF FIELD IN SIXTEEN.
 //
 // THREE LANES WERE NAMED AND ONE HAS LANDED, so this reads as two. It said "Three lanes have to
 // land for this shape to exist, and this one owns NONE of them: the address field holding the bare
@@ -4507,70 +5455,80 @@ const _: () = {
 // It is pinned here so that whoever lands the last of them finds the number already measured
 // rather than arriving at it by adjusting an assertion until it passed.
 //
-// # THE SLACK AT TWENTY-FOUR IS FOUR BYTES, NOT ZERO, AND THAT CHANGES THE NEXT DECISION
+// # THE SLACK AT THE END OF THE LEG IS ONE BYTE, AND BOTH EARLIER ANSWERS WERE WRONG
 //
-// This was scoped as "20 of field, 24 wide, zero slack". The first two are measured and the third
-// is not arithmetic any field set can satisfy: TWENTY IS NOT A MULTIPLE OF EIGHT, so a twenty-byte
-// field set inside an eight-aligned struct has FOUR bytes of padding by construction. Measured at
-// four, and asserted as four rather than as zero.
+// This was scoped as "20 of field, 24 wide, zero slack", then corrected to "20 of field, 24 wide,
+// FOUR of slack". Both were arithmetic over a field set that included `kind` and `routing_bucket`,
+// and `65c7fc562` retired both from `BlockIndex`. The probe below is the live field set with the
+// two remaining narrowings applied, and it measures FIFTEEN BYTES OF FIELD IN SIXTEEN: one byte of
+// slack, not four, at a width of sixteen, not twenty-four.
 //
-// IT MATTERS BECAUSE IT INVERTS THE RULE THIS STRUCTURE IS CURRENTLY GOVERNED BY. At 40 the entry
-// has zero slack and the block above asserts it, so the next field added costs a whole eight
-// bytes. At 24 there are four bytes standing empty, so the next field up to four bytes wide costs
-// NOTHING. Every field decision taken here while the entry was full has to be re-priced at that
-// point, not inherited. That was true of the entry at 56 and it is still true at 40: the removal
-// of the element name took a whole two words and left the field set packing exactly, so the rule
-// did not change when the width did.
+// SO THE END OF THIS LEG IS A WORD LOWER THAN RECORDED. 24 was the number to beat; it is the
+// number the FIRST of the two narrowings reaches on its own -- the identity leaving, 19 of field
+// in 24 with five of slack -- and the address word takes it to 16.
+//
+// IT STILL INVERTS THE RULE THIS STRUCTURE IS GOVERNED BY, and by more than was thought. The
+// block above asserts the live entry has FIVE bytes of slack at 40, not zero, so the next field
+// added here up to five bytes wide already costs nothing; at 24 the slack is five again, and at 16
+// it is one. Every field decision taken here while the entry was believed to be exactly full has
+// to be re-priced rather than inherited.
 const _: () = {
     #[allow(dead_code)]
     struct TheEntryAtTheEndOfTheNarrowings {
-        kind: crate::index_log::IndexItemKind,
-        routing_bucket: u32,
         object_key: u32,
         model_id: crate::engine::storage_bucket_internals::StoredModelKind,
         address: crate::block_store::BlockAddress,
         dirty: bool,
         deleted: bool,
     }
-    let field_sum = std::mem::size_of::<crate::index_log::IndexItemKind>()
-        + std::mem::size_of::<u32>()
-        + std::mem::size_of::<u32>()
+    let field_sum = std::mem::size_of::<u32>()
         + std::mem::size_of::<crate::engine::storage_bucket_internals::StoredModelKind>()
         + std::mem::size_of::<crate::block_store::BlockAddress>()
         + std::mem::size_of::<bool>()
         + std::mem::size_of::<bool>();
     // THE TWO NUMBERS, asserted independently and neither read off the other.
-    assert!(field_sum == 20);
-    assert!(std::mem::size_of::<TheEntryAtTheEndOfTheNarrowings>() == 24);
+    assert!(field_sum == 15);
+    assert!(std::mem::size_of::<TheEntryAtTheEndOfTheNarrowings>() == 16);
     // THE ROUNDING RELATION, so a field set that stops rounding to 24 fails here.
     assert!(std::mem::size_of::<TheEntryAtTheEndOfTheNarrowings>() == (field_sum + 7) / 8 * 8);
-    // THE SLACK, MEASURED AT FOUR. Written as its own assertion because the claim this block
-    // exists to correct is that it is zero.
-    assert!(std::mem::size_of::<TheEntryAtTheEndOfTheNarrowings>() - field_sum == 4);
+    // THE SLACK, MEASURED AT ONE. Written as its own assertion because this block exists to
+    // correct the claim, and the claim has now been wrong twice -- at zero, then at four.
+    assert!(std::mem::size_of::<TheEntryAtTheEndOfTheNarrowings>() - field_sum == 1);
     // TIED TO `BlockIndex` ITSELF, through its field sum rather than its width -- the widths
-    // differ by a rounding and the field sums differ by exactly the narrowings. The first
-    // assertion is what makes this a claim about the real struct: it holds only while the live
-    // entry has zero slack, so a field added to or removed from `BlockIndex` breaks this block.
+    // differ by a rounding and the field sums differ by exactly the narrowings.
     //
-    // AND IT DID BREAK, WHICH IS THE PIN WORKING. `live_field_sum` carried an
-    // `Option<Arc<str>>` term for the element name and came to 56 -- main's entry. This branch
-    // removed that field, so the live entry is SEVEN fields and 40, and the assertion below went
-    // red on the merge rather than quietly describing a type that had moved. The term is dropped
-    // rather than the number adjusted.
-    let live_field_sum = std::mem::size_of::<crate::index_log::IndexItemKind>()
-        + std::mem::size_of::<u32>()
-        + std::mem::size_of::<Arc<str>>()
+    // AND THIS TERM LIST WAS THE WORST OF THE THREE STALE ONES, because it claims to BE the live
+    // entry. It read `IndexItemKind + u32 + Arc<str> + StoredModelKind + ElementEntry + bool +
+    // bool` -- seven terms summing to 40 -- and asserted `live_field_sum == size_of::<BlockIndex>()`
+    // under a note saying "it holds only while the live entry has zero slack, so a field added to
+    // or removed from `BlockIndex` breaks this block". TWO FIELDS WERE REMOVED FROM `BlockIndex`
+    // AND IT DID NOT BREAK: the live entry fell to 35 bytes of field, the retired terms were worth
+    // exactly the five bytes of slack that opened up, and 40 == 40 went on passing. It was
+    // arithmetic about two fields that do not exist.
+    //
+    // SO THE SUM IS THE LIVE FIVE TERMS AND THE RELATION IS A ROUNDING, not an equality. The live
+    // entry holds 35 bytes of field in 40, and an equality between a field sum and a width can
+    // only be written for a field set that happens to pack exactly -- which is a coincidence to
+    // assert, not an invariant.
+    let live_field_sum = std::mem::size_of::<Arc<str>>()
         + std::mem::size_of::<crate::engine::storage_bucket_internals::StoredModelKind>()
         + std::mem::size_of::<ElementEntry>()
         + std::mem::size_of::<bool>()
         + std::mem::size_of::<bool>();
-    assert!(live_field_sum == std::mem::size_of::<BlockIndex>());
+    assert!(live_field_sum == 35);
+    assert!(std::mem::size_of::<BlockIndex>() == (live_field_sum + 7) / 8 * 8);
+    assert!(std::mem::size_of::<BlockIndex>() - live_field_sum == 5);
     // AND THE DELTAS ARE TWO NOW, NOT THREE. This read `field_sum + (ElementEntry - BlockAddress)
     // + size_of::<Option<Arc<str>>>() + (Arc<str> - u32)`, naming the three narrowings that stood
     // between the live entry and the end of the leg. The middle one -- the element name leaving --
     // HAS LANDED on this branch, so it is no longer a difference between the two shapes and
-    // naming it here would double-count it. What is left between 40 and 20 is the address word and
-    // the object key.
+    // naming it here would double-count it. What is left between 35 of field and 15 is the address
+    // word and the object key: eight bytes and twelve.
+    //
+    // THE EXPRESSION IS UNCHANGED AND BOTH SIDES MOVED BY THE FIVE BYTES THE RETIRED FIELDS
+    // CARRIED -- 40 == 20 + 8 + 12 became 35 == 15 + 8 + 12 -- which is why this one assertion
+    // survives the restatement with no term touched. That is also why it could not have caught
+    // the staleness: the two retired terms appeared on BOTH sides and cancelled.
     assert!(
         live_field_sum
             == field_sum
@@ -4648,16 +5606,94 @@ impl BlockIndex {
     ///
     /// The component is NOT a term. An object id is per (shard, kind, key); which element of that
     /// object a block holds is `component`, beside the id and not inside it.
-    pub(super) fn object_id(&self, shard_id: crate::types::ShardId) -> u64 {
+    pub(super) fn object_id(&self, shard_id: crate::types::ShardId, object_key: &str) -> u64 {
         crate::engine::hashing::stable_block_object_id(
             shard_id,
             self.model_id.as_str(),
-            &self.object_key,
+            object_key,
         )
     }
 }
 
 impl CoreIndex {
+    /// THE LOOKUP ALREADY DESCRIBES THE PAGES, CHECKED WITHOUT REBUILDING IT.
+    ///
+    /// This is what replaces a `rebuild_object_block_lookup()` at a site whose filing now files
+    /// the lookup as it goes. The rebuild is an O(blocks) whole-shard pass; the claim it was
+    /// standing in for is that the lookup and the page index agree, and that is checkable without
+    /// doing the work. So in a release build the pass is simply gone, and in a debug build the
+    /// claim is verified on every run instead of being asserted in a comment.
+    ///
+    /// DELETED PAGES ARE NOT IN EITHER SIDE. `insert_object_block_lookup` returns early on a
+    /// deleted page, so the reconstruction below applies the same filter -- which is also why a
+    /// tombstone refile owes the lookup nothing and why the two sites this serves can do their
+    /// tombstone pass after their live pass with no filing in between.
+    ///
+    /// AND IT IS A SCAFFOLD WITH A LIFETIME, said here so the next reader does not inherit it as
+    /// furniture. It reads `page.object_key`, so it is one of the readers that has to go when the
+    /// identity leaves the entry -- at which point its only possible source would be the lookup it
+    /// is checking, and the check would be comparing the lookup with itself. It exists to earn the
+    /// removal of the two rebuild calls, and it is spent once the field is gone.
+    #[cfg(debug_assertions)]
+    #[track_caller]
+    pub(super) fn debug_assert_lookup_matches_the_pages(&self) {
+        let from_the_lookup = self.lookup_positions_for_comparison();
+        let mut from_the_pages: Vec<(String, String, u32, u64)> = self
+            .bucket_map
+            .iter()
+            .flat_map(|(routing_bucket, bucket)| {
+                bucket
+                    .block_index
+                    .iter()
+                    .filter(|(_, page)| !page.deleted)
+                    .map(move |(handle, page)| {
+                        (
+                            page.model_id.as_str().to_string(),
+                            page.object_key.to_string(),
+                            *routing_bucket,
+                            *handle,
+                        )
+                    })
+            })
+            .collect();
+        from_the_pages.sort();
+        debug_assert_eq!(
+            from_the_lookup,
+            from_the_pages,
+            "the object lookup does not describe this index's live pages: {} position(s) in the \
+             lookup against {} named by the pages. A site that files a page is not filing the \
+             lookup for it, or is filing it differently from the way a rebuild would",
+            from_the_lookup.len(),
+            from_the_pages.len()
+        );
+    }
+
+    /// The lookup as a comparable set of (kind, object key, bucket, handle).
+    ///
+    /// Sorted rather than hashed, so a disagreement prints in a stable order; and built from
+    /// `iter()` rather than from a `PartialEq` on the lookup, because the arms that would collapse
+    /// -- which slot an id sits in, how a tier is represented -- are not part of the claim. What
+    /// the claim is about is which positions name which object.
+    #[cfg(debug_assertions)]
+    fn lookup_positions_for_comparison(&self) -> Vec<(String, String, u32, u64)> {
+        let mut rows: Vec<(String, String, u32, u64)> = self
+            .object_block_lookup
+            .iter()
+            .flat_map(|(model_id, object_key, refs)| {
+                refs.iter().map(move |block_ref| {
+                    (
+                        model_id.to_string(),
+                        object_key.to_string(),
+                        block_ref.routing_bucket,
+                        block_ref.block_ref_key,
+                    )
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
     pub(super) fn rebuild_object_block_lookup(&mut self) {
         // The rebuild is already O(blocks); establishing the total here costs nothing extra and
         // is what lets the stats path stop walking the shard.
@@ -4673,7 +5709,12 @@ impl CoreIndex {
             })
             .collect::<Vec<_>>();
         for (routing_bucket, block_ref_key, page) in refs {
-            self.insert_object_block_lookup(routing_bucket, block_ref_key, &page);
+            self.insert_object_block_lookup(
+                routing_bucket,
+                block_ref_key,
+                &Arc::clone(&page.object_key),
+                &page,
+            );
         }
     }
 
@@ -4684,6 +5725,10 @@ impl CoreIndex {
         &mut self,
         routing_bucket: u32,
         block_ref_key: u64,
+        // THE IDENTITY, PASSED IN. The lookup is keyed by it and the entry is about to stop
+        // carrying it, so it arrives from the caller -- which always has it, because filing a page
+        // is something done TO an object.
+        object_key: &Arc<str>,
         page: &BlockIndex,
     ) {
         if page.deleted {
@@ -4716,13 +5761,23 @@ impl CoreIndex {
             // maps straight to its refs -- see [`ObjectBlockLookup`] on what each one carried, and
             // on the one piece that had to stay, because the component ARGUMENT on the readers and
             // the removers still comes from callers and is still sometimes `Some`.
-            self.object_block_lookup.file(&kind, &page.object_key, value)
+            self.object_block_lookup.file(&kind, object_key, value)
         };
         if added {
             if let Some(total) = self.object_component_block_refs.as_mut() {
                 *total = total.saturating_add(1);
             }
         }
+    }
+
+    /// EVERY PAGE'S OBJECT IDENTITY, INDEXED BY THE POSITION THE PAGE IS HELD AT.
+    ///
+    /// Built once by a reader that walks pages and needs to know which object each belongs to --
+    /// see [`PageKeysByPosition`] for what it costs and [`PageKeysByPosition::identity_of`] for
+    /// the two sources a page can be named by. A reader that starts FROM an object wants
+    /// [`Self::block_refs_for`] instead and should not build this.
+    pub(super) fn page_identities(&self) -> PageKeysByPosition<'_> {
+        PageKeysByPosition::from_lookup(&self.object_block_lookup)
     }
 
     /// Every block ref this object holds, for one component.
@@ -4885,7 +5940,11 @@ impl CoreIndex {
                     .map(|page| {
                         !page.deleted
                             && page.model_id.as_str() == model_id
-                            && &*page.object_key == object_key
+                            // THE IDENTITY IS NOT RE-COMPARED. This read
+                            // `&*page.object_key == object_key` against a page reached through
+                            // THAT object's own ref list, so it asked whether the lookup was
+                            // right rather than which object the page belongs to.
+                            //
                             // The entry carries no element name; `component.is_none()` is the old
                             // `page.component.as_deref() == component` with that constant folded
                             // in, so the kinds this answers for do not move.
@@ -4896,20 +5955,11 @@ impl CoreIndex {
             });
         }
 
-        if !self.object_block_lookup.is_empty() {
-            return false;
-        }
-
-        self.bucket_map.values().any(|bucket| {
-            bucket.block_index.values().any(|page| {
-                !page.deleted
-                    && page.model_id.as_str() == model_id
-                    && &*page.object_key == object_key
-                    // The no-lookup twin of the predicate above, translated the same way.
-                    && component.is_none()
-                    && same_block_address(&page.address, address)
-            })
-        })
+        // AND NO SECOND ARM. A whole-shard walk comparing every entry's identity stood here for
+        // the case where the lookup held nothing, which is an index with pages and no lookup --
+        // the window between a decode and the rebuild that used to fill it. The decode fills it
+        // now, so the object having no entry in the lookup means the object has no live page.
+        false
     }
 }
 
@@ -4940,13 +5990,35 @@ pub(super) fn next_block_index_for_object(
         .bucket_map
         .get(&routing_bucket)
         .and_then(|bucket| {
+            // THE IDENTITY COMES FROM BESIDE THE BLOCK, FROM BOTH SOURCES.
+            //
+            // A block id is an ordinal INSIDE its object and must never be reused: this store
+            // keeps a rewritten block's predecessor live, so an object numbering from zero again
+            // would have two live blocks claiming one position. The lookup holds LIVE pages only
+            // -- `insert_object_block_lookup` returns early on a deleted one -- so selecting on it
+            // alone would step back over a deleted block's ordinal and hand it out twice.
+            // `identity_of` reads the lookup for a live page and this bucket's own tombstone rows
+            // for a deleted one, which is why it is the door used here.
+            let identities = PageKeysByPosition::from_lookup(&bucket_index.object_block_lookup);
             bucket
                 .block_index
-                .values()
-                .filter(|block| {
-                    block.model_id.as_str() == model_id && block.object_key.as_ref() == object_key
+                .iter()
+                .filter(|(handle, block)| {
+                    block.model_id.as_str() == model_id
+                        && identities
+                            .identity_of(bucket, **handle, block)
+                            .is_some_and(|beside| {
+                                // THE TIE BACK TO THE ENTRY'S OWN COPY. It goes with the field.
+                                debug_assert_eq!(
+                                    &*block.object_key,
+                                    &**beside.object_key,
+                                    "the identity beside this block names a different object \
+                                     from the one on it"
+                                );
+                                &**beside.object_key == object_key
+                            })
                 })
-                .filter_map(|block| block.address.block_id())
+                .filter_map(|(_, block)| block.address.block_id())
                 .max()
         })
         .map_or(0, |highest| {
@@ -5283,14 +6355,77 @@ mod component_lookup_tests {
     /// [`the_insert_accumulates_an_objects_pages_into_the_one_slot`].
     fn page(object: &str) -> BlockIndex {
         BlockIndex {
-            kind: crate::index_log::IndexItemKind::Page,
-            routing_bucket: 7,
             object_key: Arc::from(object.to_string()),
             model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
             address: ElementEntry::from_parts(0, 0, 0, None, Some(0)),
             dirty: false,
             deleted: false,
         }
+    }
+
+    /// EVERY ROUTE BY WHICH A `CoreIndex` COMES INTO EXISTENCE REPORTS A REF TOTAL OF ZERO.
+    ///
+    /// `None` on this field means "nobody has established this count", and an increment against it
+    /// is dropped on purpose -- so an index built by a route that leaves it `None` can never
+    /// arrive at a right answer by filing. The claim is therefore about the ROUTES, not about one
+    /// constructor, and the routes are the ones the compiler named when `Default` came off the
+    /// derive: two explicit sites, and three that no site list could have covered.
+    ///
+    /// THE THIRD ROUTE IS THE ONE THAT MATTERS AND IT IS A REAL FILE. `bucket_index` carries
+    /// `#[serde(default)]`, so an index whose stored bytes have no `slot_index` key decodes
+    /// through `Default` and never reaches the hand-written `Deserialize` that sets zero. That
+    /// arm is driven here by TAKING THE KEY OUT of a serialized shard rather than by hand-writing
+    /// JSON, so the input is the shape this engine actually writes minus one key.
+    ///
+    /// AND BOTH DECODE PATHS ARE ASSERTED, which is what keeps this from passing on half the
+    /// claim: an index WITH the key must come back established too, or the arm above would be
+    /// satisfied by a decoder that established nothing and a `Default` that did all the work.
+    ///
+    /// rust-internal: index construction invariant, no product behaviour
+    #[test]
+    fn a_default_index_reports_a_ref_total_of_zero_by_every_route_one_is_built() {
+        assert_eq!(
+            Some(0),
+            CoreIndex::default().object_component_block_refs,
+            "the explicit route left the ref total unestablished"
+        );
+        assert_eq!(
+            Some(0),
+            ShardState::default().bucket_index.object_component_block_refs,
+            "a default shard's index left the ref total unestablished, so every route through \
+             `ShardState::default()` starts with a counter no filing can correct"
+        );
+
+        // --- The serde(default) route: the same bytes this engine writes, minus the one key. ---
+        let mut stored = serde_json::to_value(ShardState::default())
+            .expect("a default shard serializes");
+        let object = stored
+            .as_object_mut()
+            .expect("a serialized shard is a JSON object");
+        assert!(
+            object.remove("slot_index").is_some(),
+            "the serialized shard carried no `slot_index` key, so removing it is not the arm this \
+             test means to drive and the decode below would prove nothing"
+        );
+        let without_the_key: ShardState =
+            serde_json::from_value(stored).expect("a shard without the index key decodes");
+        assert_eq!(
+            Some(0),
+            without_the_key.bucket_index.object_component_block_refs,
+            "a stored index with no `slot_index` key decoded to a counter no filing can correct, \
+             which is the route a site list cannot cover"
+        );
+
+        // --- And the decode path that DOES carry the key, so this is not half a claim. ---
+        let with_the_key: ShardState = serde_json::from_value(
+            serde_json::to_value(ShardState::default()).expect("a default shard serializes"),
+        )
+        .expect("a shard with the index key decodes");
+        assert_eq!(
+            Some(0),
+            with_the_key.bucket_index.object_component_block_refs,
+            "the decoder left the ref total unestablished on an index that carried the key"
+        );
     }
 
     /// Built through the real insert rather than assembled by hand, and that is deliberate rather
@@ -5300,22 +6435,29 @@ mod component_lookup_tests {
     /// Each page gets its own `(routing_bucket, block_ref_key)` -- `(i, i)` -- so `pages` DISTINCT
     /// refs go in, and a count below is not a count of one ref filed repeatedly.
     fn core_with(object: &str, pages: u32) -> CoreIndex {
-        let mut index = CoreIndex::default();
-        // ESTABLISH THE REF COUNTER FIRST, WHICH IS WHAT A REBUILD DOES AND WHAT A DEFAULT
-        // `CoreIndex` DOES NOT.
+        let index = CoreIndex::default();
+        // THE COUNTER IS ESTABLISHED BY THE TYPE NOW, AND THIS FIXTURE USED TO DO IT BY HAND.
         //
-        // `object_component_block_refs` is `None` on a default index, and `None` means UNKNOWN
-        // rather than zero: `insert_object_block_lookup` increments only `if let Some(total)`, so
-        // on an unestablished counter every increment is dropped on purpose -- a count that starts
-        // at "unknown" cannot be incremented into a right answer. `rebuild_object_block_lookup`
-        // sets it to `Some(0)` before it re-inserts, and that is the state every arm below is
-        // about, so the fixture reaches it the same way instead of asserting over `None`.
+        // It read "`object_component_block_refs` is `None` on a default index, and `None` means
+        // UNKNOWN rather than zero", and set `Some(0)` itself with a note that three arms here had
+        // asserted `Some(n)` without the line and read back `None`. `impl Default for CoreIndex`
+        // writes that zero now, so the line was a no-op -- and a no-op that STILL COMPILED and
+        // still read as the thing establishing the state, which is the shape this tree keeps a
+        // record of. Removed rather than left, so the arms below depend on the type's claim and go
+        // red with it if anyone takes it away.
         //
-        // CAUGHT BY ITS OWN FAILURE: three arms here asserted `Some(n)` without this line and read
-        // back `None`. The fixture was wrong, not the counter.
-        index.object_component_block_refs = Some(0);
+        // The reasoning itself has not changed and has only moved: `insert_object_block_lookup`
+        // increments only `if let Some(total)`, so a count that starts at "unknown" cannot be
+        // incremented into a right answer.
+        let mut index = index;
         for i in 0..pages {
-            index.insert_object_block_lookup(i, u64::from(i), &page(object));
+            let filed = page(object);
+            index.insert_object_block_lookup(
+                i,
+                u64::from(i),
+                &std::sync::Arc::clone(&filed.object_key),
+                &filed,
+            );
         }
         index
     }
@@ -5390,7 +6532,13 @@ mod component_lookup_tests {
         index.object_component_block_refs = Some(0);
         // DESCENDING: (3,3), (2,2), (1,1), (0,0).
         for i in (0..PAGES).rev() {
-            index.insert_object_block_lookup(i, u64::from(i), &page("k"));
+            let filed = page("k");
+            index.insert_object_block_lookup(
+                i,
+                u64::from(i),
+                &std::sync::Arc::clone(&filed.object_key),
+                &filed,
+            );
         }
 
         let refs = index

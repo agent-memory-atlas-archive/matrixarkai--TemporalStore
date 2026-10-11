@@ -326,15 +326,19 @@ fn pages_per_object(engine: &TemporalEngine) -> PagesPerObject {
     let shard = shards.get(&1).expect("shard is loaded");
     let mut per_object: BTreeMap<(StoredModelKind, String), (usize, BTreeSet<String>)> =
         BTreeMap::new();
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut measured = PagesPerObject::default();
     for bucket in shard.bucket_index.bucket_map.values() {
         let mut bucket_components: BTreeSet<Option<&str>> = BTreeSet::new();
-        for (_, page) in bucket.block_index.iter() {
+        for (handle, page) in bucket.block_index.iter() {
             measured.pages += 1;
             // One member for any non-empty bucket: every entry carries the same absence.
             bucket_components.insert(None::<&str>);
             let slot = per_object
-                .entry((page.model_id, page.object_key.to_string()))
+                .entry((
+                    page.model_id,
+                    named.at(bucket.routing_bucket, *handle).to_string(),
+                ))
                 .or_default();
             slot.0 += 1;
             // NO ELEMENT NAME ON THE ENTRY, so the component columns of this census -- distinct
@@ -585,11 +589,17 @@ fn measure_object_key_table(engine: &TemporalEngine) -> TableCost {
     let shard = shards.get(&1).expect("shard is loaded");
     let mut pages = 0usize;
     // Collected first, so the probe charges the TABLE and not the walk that feeds it.
+    //
+    // THE NAMES COME FROM THE LOOKUP, WHICH IS WHERE THE ALLOCATION THEY MEASURE NOW LIVES. The
+    // table this prices interns shared names; the pages have none of their own, so the shared
+    // names the bucket's own lookup holds are the input, and that is the same set of `Arc`s the
+    // table would be fed in production.
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut names: Vec<Arc<str>> = Vec::new();
     for bucket in shard.bucket_index.bucket_map.values() {
-        for (_, page) in bucket.block_index.iter() {
+        for (handle, _page) in bucket.block_index.iter() {
             pages += 1;
-            names.push(Arc::clone(&page.object_key));
+            names.push(Arc::clone(named.at(bucket.routing_bucket, *handle)));
         }
     }
     let probe = Probe::start();
@@ -1053,17 +1063,26 @@ fn the_entry_is_forty_bytes_and_every_one_is_accounted_for() {
     // TO COST, because the verdicts below are stated against that arithmetic -- what each of the
     // three names would be worth -- and it is now a counterfactual rather than a measurement.
     let component_when_it_was_a_field = size_of::<Option<Arc<str>>>();
-    let flags = 3usize;
+    // TWO FLAG BYTES, NOT THREE, AND THE ROUNDING HID THE THIRD.
+    //
+    // This read `3usize`. The entry holds `dirty` and `deleted` and nothing else -- `log_backed`
+    // is an accessor over the address, not a field -- so the tail is two bytes. The
+    // reconstruction below went on passing anyway: a tail of three and a tail of four both round
+    // to one word, so the sum reached the same width either way. That is the same word-granularity
+    // blindness `entry_width_at_each_step` documents for its own mirror and
+    // `an_assigned_durable_id_defeats_ground_one_only` carried in four of them.
+    //
+    // SPELLED AS THE TYPES, so a flag that stops being a `bool` fails here instead of leaving a
+    // literal right by luck.
+    let flags = size_of::<bool>() + size_of::<bool>();
 
     println!("\n=== BlockIndex, field by field ===");
-    println!("  offsets: address@{} object_key@{} model_id@{} dirty@{} deleted@{} kind@{} routing_bucket@{}",
+    println!("  offsets: address@{} object_key@{} model_id@{} dirty@{} deleted@{}",
         offset_of!(BlockIndex, address),
         offset_of!(BlockIndex, object_key),
         offset_of!(BlockIndex, model_id),
         offset_of!(BlockIndex, dirty),
         offset_of!(BlockIndex, deleted),
-        offset_of!(BlockIndex, kind),
-        offset_of!(BlockIndex, routing_bucket),
     );
     println!(
         "  address {address} + object_key {object_key} + model_id {model} \
@@ -1344,15 +1363,13 @@ fn a_released_bucket_reloads_every_name_element_by_element() {
 fn page_triples(engine: &TemporalEngine) -> Vec<(String, String, Option<String>, u64, u64)> {
     let shards = engine.shards.read().expect("engine lock poisoned");
     let shard = shards.get(&1).expect("shard is loaded");
-    let mut triples: Vec<(String, String, Option<String>, u64, u64)> = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.iter())
-        .map(|(_, page)| {
+    let mut triples: Vec<(String, String, Option<String>, u64, u64)> =
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(_, _, object_key, page)| {
             (
                 page.model_id.as_str().to_string(),
-                page.object_key.to_string(),
+                object_key.to_string(),
                 None::<String>,
                 page.address.block_slab_id(),
                 page.address.offset(),
@@ -1383,16 +1400,25 @@ fn a_stored_spelling_with_no_row_is_refused_by_name_at_the_decode() {
     // PLANTED ON A REAL ENTRY. Encoding a hand-written map would make this test assert about an
     // address wire shape it has no business knowing; mutating one field of a genuine encoding
     // plants exactly the defect and nothing else.
-    let mut json = serde_json::to_value(&sample_entry()).expect("encode");
+    let mut json = serde_json::to_value(&crate::engine::state::PageEntryAt {
+        page: &sample_entry(),
+        object_key: SAMPLE_ENTRY_OBJECT_KEY,
+    })
+    .expect("encode");
     json["model_id"] = serde_json::Value::String("not_a_model_kind".to_string());
-    let _: BlockIndex = serde_json::from_value(json).expect("the decode must be reached");
+    let _ = serde_json::from_value::<crate::engine::state::StoredPageEntry>(json)
+        .expect("the decode must be reached");
 }
+
+/// THE OBJECT [`sample_entry`] BELONGS TO, named once rather than at each encode.
+///
+/// The stored key is composed from the identity held BESIDE the page, so an arm that encodes one
+/// has to state which object it means. Same characters `sample_entry` puts on the entry.
+const SAMPLE_ENTRY_OBJECT_KEY: &str = "k";
 
 /// One page entry, for the tests that mutate a single field of a real encoding.
 fn sample_entry() -> BlockIndex {
     BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 7,
         object_key: Arc::from("k"),
         model_id: StoredModelKind::String,
         address: crate::block_store::ElementEntry::from_parts(1, 2, 4, Some(5), Some(6)),
@@ -1491,9 +1517,13 @@ fn the_two_derivations_of_the_report_byte_agree() {
 fn a_retired_spelling_still_decodes_into_a_page_entry() {
     let mut seen = 0usize;
     for spelling in ["sequence", "context_embedding"] {
-        let mut json = serde_json::to_value(&sample_entry()).expect("encode");
+        let mut json = serde_json::to_value(&crate::engine::state::PageEntryAt {
+            page: &sample_entry(),
+            object_key: SAMPLE_ENTRY_OBJECT_KEY,
+        })
+        .expect("encode");
         json["model_id"] = serde_json::Value::String(spelling.to_string());
-        let page: BlockIndex = serde_json::from_value(json)
+        let page = serde_json::from_value::<crate::engine::state::StoredPageEntry>(json)
             .unwrap_or_else(|err| panic!("a store carrying {spelling:?} must still load: {err}"));
         assert_eq!(
             spelling,
@@ -1543,9 +1573,13 @@ fn the_model_spelling_did_not_move_on_the_wire_and_the_entry_lost_three_steps_in
     // from an equal-valued map so the golden is the VALUE, not this type's own impl.
     let page = sample_entry();
 
-    let named = rmp_serde::to_vec_named(&page).expect("named encode");
-    let positional = rmp_serde::to_vec(&page).expect("positional encode");
-    let json = serde_json::to_value(&page).expect("json encode");
+    // THROUGH THE WRAPPER IN ALL THREE ENCODINGS, and the msgpack pair is why the wrapper counts
+    // its fields rather than hard-coding one: `to_vec` writes the entry POSITIONALLY, so a field
+    // count or an order that moved would move these bytes and not just the named form's.
+    let at = crate::engine::state::PageEntryAt { page: &page, object_key: SAMPLE_ENTRY_OBJECT_KEY };
+    let named = rmp_serde::to_vec_named(&at).expect("named encode");
+    let positional = rmp_serde::to_vec(&at).expect("positional encode");
+    let json = serde_json::to_value(&at).expect("json encode");
 
     println!(
         "\n=== the stored spelling ===\n  named {} B, positional {} B\n  json {}",
@@ -1566,14 +1600,33 @@ fn the_model_spelling_did_not_move_on_the_wire_and_the_entry_lost_three_steps_in
 
     // And it round-trips through both encoders, positionally included -- which is the encoder a
     // shifted field would break.
-    let from_named: BlockIndex = rmp_serde::from_slice(&named).expect("named decode");
-    let from_positional: BlockIndex = rmp_serde::from_slice(&positional).expect("positional decode");
-    for (label, decoded) in [("named", &from_named), ("positional", &from_positional)] {
+    // DECODED INTO THE STORED SHAPE, which is what the wire holds: the entry itself has no
+    // `Deserialize`, and the positional encode is exactly why that matters -- a field count or an
+    // order that moved between the two wrappers would land here and nowhere else.
+    let (named_key, from_named) =
+        rmp_serde::from_slice::<crate::engine::state::StoredPageEntry>(&named)
+            .expect("named decode")
+            .into_parts();
+    let (positional_key, from_positional) =
+        rmp_serde::from_slice::<crate::engine::state::StoredPageEntry>(&positional)
+            .expect("positional decode")
+            .into_parts();
+    for (label, key, decoded) in [
+        ("named", &named_key, &from_named),
+        ("positional", &positional_key, &from_positional),
+    ] {
         assert_eq!(
             page.model_id, decoded.model_id,
             "{label}: the spelling did not survive the round trip"
         );
-        assert_eq!(page.object_key, decoded.object_key, "{label}: object_key moved");
+        // THE IDENTITY IS COMPARED AGAINST WHAT THE FIXTURE NAMED, not against a copy on the
+        // decoded entry. It arrives BESIDE the entry now, which is the whole of the move: the key
+        // the encoder was handed is the key the decoder hands back.
+        assert_eq!(
+            SAMPLE_ENTRY_OBJECT_KEY,
+            &**key,
+            "{label}: object_key moved across the round trip"
+        );
         // No component on the entry, so there is no such field to survive a round trip.
         assert_eq!(page.dirty, decoded.dirty, "{label}: dirty moved");
         assert_eq!(page.deleted, decoded.deleted, "{label}: deleted moved");
@@ -1993,8 +2046,9 @@ fn an_empty_value_still_carries_a_length_so_the_zero_length_tombstone_is_open() 
     let mut zero_length_live = 0usize;
     let mut nonzero_length_live = 0usize;
     let mut deleted_pages = 0usize;
+    let named = super::PageObjects::of(&shard.bucket_index);
     for bucket in shard.bucket_index.bucket_map.values() {
-        for (_, page) in bucket.block_index.iter() {
+        for (handle, page) in bucket.block_index.iter() {
             if page.deleted {
                 deleted_pages += 1;
                 continue;
@@ -2004,7 +2058,7 @@ fn an_empty_value_still_carries_a_length_so_the_zero_length_tombstone_is_open() 
                 println!(
                     "  live zero-length page: model={} key={}",
                     page.model_id.as_str(),
-                    page.object_key
+                    named.at(bucket.routing_bucket, *handle)
                 );
             } else {
                 nonzero_length_live += 1;

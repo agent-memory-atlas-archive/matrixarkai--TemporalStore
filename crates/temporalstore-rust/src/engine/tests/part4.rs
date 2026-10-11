@@ -4579,21 +4579,17 @@ fn dirty_objects_versus_the_blocks_own_dirty_flags() {
     let shards = engine.shards.read().expect("shards lock poisoned");
     let shard = shards.get(&1).expect("shard 1 loaded");
 
-    let blocks_marked_dirty: std::collections::BTreeSet<String> = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.values())
-        .filter(|page| page.dirty)
-        .map(|page| page.object_key.to_string())
-        .collect();
-    let any_block_at_all: std::collections::BTreeSet<String> = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.values())
-        .map(|page| page.object_key.to_string())
-        .collect();
+    let blocks_marked_dirty: std::collections::BTreeSet<String> =
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .filter(|(_, _, _, page)| page.dirty)
+            .map(|(_, _, object_key, _)| object_key.to_string())
+            .collect();
+    let any_block_at_all: std::collections::BTreeSet<String> =
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(_, _, object_key, _)| object_key.to_string())
+            .collect();
 
     let in_set_not_flagged: Vec<&str> = shard
         .dirty_objects
@@ -5006,25 +5002,34 @@ fn how_many_times_one_object_key_is_stored() {
             holders += 1;
         }
     }
-    for bucket in shard.bucket_index.bucket_map.values() {
-        for (_ref_key, page) in bucket.block_index.iter() {
-            if page.object_key.as_ref() == &*sample {
-                allocations.insert(page.object_key.as_ptr());
-                holders += 1;
-            }
-        }
-    }
-
+    // THE PAGE INDEX IS NO LONGER A HOLDER, AND THAT IS THE FINDING RATHER THAN A GAP IN THE
+    // CENSUS. This walk added one holder and one allocation per PAGE of the sampled object. A
+    // page entry has no key, so there is nothing to insert and nothing to count -- and the
+    // allocation those pages pointed at was the lookup's, which is counted one loop above.
+    //
+    // IT IS REMOVED RATHER THAN LEFT COUNTING THE LOOKUP'S COPY THROUGH THE PAGES. Reaching the
+    // lookup's `Arc` by walking pages and charging it once per page would report the cost as if
+    // nothing had changed, which is exactly the mistake the `model_id` comment in
+    // `blocks_of_one_kind_spend_one_byte_and_share_one_static_spelling` names.
     assert!(holders > 0, "the sampled key was found nowhere; nothing was measured");
+    // AND THE PAGE INDEX IS NOT EMPTY, so the holder above being absent cannot be read as "this
+    // store has no pages". Without this the removal above and an empty fixture look identical.
+    assert!(
+        shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .any(|bucket| !bucket.block_index.is_empty()),
+        "the store holds no page at all, so the page index's absence from the holder list above          says nothing about where this key is held"
+    );
 
     let key_bytes: usize = shard.strings.keys().map(|key| key.len()).sum();
-    let block_key_bytes: usize = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.values())
-        .map(|page| page.object_key.len())
-        .sum();
+    // STRUCTURALLY ZERO, AND KEPT AS A ROW RATHER THAN DELETED. The page index held one `Arc<str>`
+    // per entry; it holds none, so its contribution to the key text of this store is nothing at
+    // all. The row stays in the table because the table is read as "where the key copies live",
+    // and a row that has gone to zero is the answer to that question rather than an absence from
+    // it. The per-object cost it used to duplicate is the `object_page_lookup keys` row below.
+    let block_key_bytes: usize = 0;
     // No concatenation any more: what the lookup holds per object is the object key itself.
     let lookup_key_bytes: usize = shard
         .bucket_index
@@ -5133,19 +5138,36 @@ fn the_block_and_the_lookup_point_at_one_object_key() {
     let shards = engine.shards.read().expect("shards lock poisoned");
     let shard = shards.get(&1).expect("shard 1 loaded");
 
+    // THE CLAIM MOVED FROM THE ENTRY'S COPY TO THE ONE THE READ PATH HANDS OUT, and it is the
+    // same claim about the same allocation.
+    //
+    // WHAT IT ASSERTED: the `Arc` on the page and the `Arc` in the lookup are ONE allocation, not
+    // two copies of one string. The entry has no `Arc` now -- so taken literally the claim is
+    // true of nothing, and a test that asserted it would pass for free.
+    //
+    // WHAT IT ASSERTS INSTEAD: the identity a reader is HANDED for a page is the lookup's own
+    // allocation. Every production reader reaches a page's object through `PageKeysByPosition`,
+    // which is built by inverting the lookup, and `page_identities_in` hands back
+    // `Arc::clone` of what it found. A clone shares the buffer, so `as_ptr` must equal
+    // `key_ptr`'s -- and if the inversion ever started copying the text instead, this reddens.
+    // That is a load-bearing property rather than a curiosity: forty walks in this module tree
+    // take a key per page that way, and a copy per page would put the duplication this change
+    // removed straight back, one level out.
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut checked = 0usize;
     let mut shared = 0usize;
     for bucket in shard.bucket_index.bucket_map.values() {
-        for (_ref_key, page) in bucket.block_index.iter() {
+        for (ref_key, page) in bucket.block_index.iter() {
+            let handed_out = named.at(bucket.routing_bucket, *ref_key);
             let Some(refs) = shard
                 .bucket_index
                 .object_block_lookup
-                .key_ptr(page.model_id.as_str(), page.object_key.as_ref())
+                .key_ptr(page.model_id.as_str(), handed_out.as_ref())
             else {
                 continue;
             };
             checked += 1;
-            if std::ptr::eq(refs, page.object_key.as_ptr()) {
+            if std::ptr::eq(refs, handed_out.as_ptr()) {
                 shared += 1;
             }
         }
@@ -5155,7 +5177,7 @@ fn the_block_and_the_lookup_point_at_one_object_key() {
     assert!(checked > 0, "no page was matched to a lookup entry; nothing was measured");
     assert_eq!(
         shared, checked,
-        "{shared} of {checked} pages share their key with the lookup; the rest hold a second copy"
+        "{shared} of {checked} pages are handed an object key that is the lookup's own          allocation; for the rest the read path made a COPY of the text, which is the duplication          this change removed reappearing one level out"
     );
 }
 
@@ -5199,15 +5221,17 @@ fn a_block_whose_address_carries_no_object_id_still_reports_one() {
 
     let shards = engine.shards.read().expect("shards lock poisoned");
     let shard = shards.get(&1).expect("shard 1 loaded");
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut seen = 0usize;
     for bucket in shard.bucket_index.bucket_map.values() {
-        for (_ref_key, page) in bucket.block_index.iter() {
-            if page.object_key.as_ref() != "orphan-key" {
+        for (ref_key, page) in bucket.block_index.iter() {
+            let object_key = named.at(bucket.routing_bucket, *ref_key);
+            if object_key.as_ref() != "orphan-key" {
                 continue;
             }
             seen += 1;
             assert_ne!(
-                page.object_id(1),
+                page.object_id(1, object_key),
                 0,
                 "a page filed from an address with no object id must still report the computed one"
             );
@@ -5215,7 +5239,7 @@ fn a_block_whose_address_carries_no_object_id_still_reports_one() {
             // the same function and comparing it with itself: the bucket's object index was
             // populated from the id the write path actually used.
             assert!(
-                bucket.object_index.contains(&page.object_id(1)),
+                bucket.object_index.contains(&page.object_id(1, object_key)),
                 "the id the page reports must be the one the write path filed it under"
             );
         }
@@ -5306,13 +5330,10 @@ fn rewriting_a_block_does_not_reuse_its_index_key() {
     let after_first: Vec<String> = {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        shard
-            .bucket_index
-            .bucket_map
-            .values()
-            .flat_map(|bucket| bucket.block_index.iter())
-            .filter(|(_, page)| page.object_key.as_ref() == key)
-            .map(|(ref_key, _)| ref_key.to_string())
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .filter(|(_, _, object_key, _)| object_key.as_ref() == key)
+            .map(|(_, handle, _, _)| handle.to_string())
             .collect()
     };
 
@@ -5323,13 +5344,10 @@ fn rewriting_a_block_does_not_reuse_its_index_key() {
     let after_second: Vec<String> = {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        shard
-            .bucket_index
-            .bucket_map
-            .values()
-            .flat_map(|bucket| bucket.block_index.iter())
-            .filter(|(_, page)| page.object_key.as_ref() == key)
-            .map(|(ref_key, _)| ref_key.to_string())
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .filter(|(_, _, object_key, _)| object_key.as_ref() == key)
+            .map(|(_, handle, _, _)| handle.to_string())
             .collect()
     };
 
@@ -5368,8 +5386,6 @@ fn rewriting_a_block_does_not_reuse_its_index_key() {
 #[test]
 fn installing_the_same_block_twice_replaces_it() {
     let page = || crate::engine::state::BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 7,
         object_key: Arc::from("twice".to_string()),
         model_id: crate::engine::storage_bucket_internals::StoredModelKind::String,
         address: ElementEntry::from_parts(1, 0, 4, Some(1), Some(30)),
@@ -5379,8 +5395,9 @@ fn installing_the_same_block_twice_replaces_it() {
 
     let mut map = crate::engine::state::BlockIndexMap::default();
     let mut live = crate::engine::state::BlockSlabLiveIndex::default();
-    let first = map.insert(page(), &mut live);
-    let second = map.insert(page(), &mut live);
+    let object_key: Arc<str> = Arc::from("twice");
+    let first = map.insert(&object_key, page(), &mut live);
+    let second = map.insert(&object_key, page(), &mut live);
 
     assert_eq!(first, second, "the same page must land on the same handle");
     assert_eq!(map.len(), 1, "installing it twice must not add a second entry");
@@ -5388,7 +5405,7 @@ fn installing_the_same_block_twice_replaces_it() {
     // A block differing in one identity field is a different block and keeps its own slot.
     let mut moved = page();
     moved.address = ElementEntry::from_parts(1, 64, 4, Some(1), Some(30));
-    let third = map.insert(moved, &mut live);
+    let third = map.insert(&object_key, moved, &mut live);
     assert_ne!(first, third, "a page at another offset is not the same page");
     assert_eq!(map.len(), 2);
 
@@ -5443,7 +5460,8 @@ fn dumping_the_block_index_does_not_copy_it_first() {
             .expect("the writes must produce pages");
 
         let probe = crate::alloc_probe::Probe::start();
-        let json = serde_json::to_string(&bucket.block_index).expect("the index serializes");
+        let json = serde_json::to_string(&crate::engine::state::PageIndexNamedBy(&bucket.block_index, &["dumped"]))
+            .expect("the index serializes");
         let counts = probe.stop();
         assert!(!json.is_empty());
         counts.allocs
@@ -5503,7 +5521,8 @@ fn the_block_index_dump_is_ordered_by_its_written_key() {
         .find(|b| b.block_index.len() > 4)
         .expect("the writes must produce several pages in one bucket");
 
-    let json = serde_json::to_string(&bucket.block_index).expect("the index serializes");
+    let json = serde_json::to_string(&crate::engine::state::PageIndexNamedBy(&bucket.block_index, &["ordered"]))
+        .expect("the index serializes");
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
     let keys: Vec<String> = value
         .as_object()
@@ -5636,10 +5655,15 @@ fn the_block_index_still_writes_string_keys() {
     let (handle, page) = bucket.block_index.iter().next().expect("one page");
     assert!(*handle > 0, "the map assigns a handle");
 
-    // On the wire: the same rendered key it always wrote, rebuilt from the block.
-    let json = serde_json::to_value(&bucket.block_index).unwrap();
+    // On the wire: the same rendered key it always wrote, rebuilt from the block AND the identity
+    // beside it -- which is where the renderer takes it from now.
+    let named = super::PageObjects::of(&shard.bucket_index);
+    let json = serde_json::to_value(&crate::engine::state::PageIndexNamedBy(&bucket.block_index, &["dumped"])).unwrap();
     let written = json.as_object().expect("the wire form is a map of string keys");
-    let expected = crate::engine::state::block_index_written_key(page);
+    let expected = crate::engine::state::block_index_written_key(
+        named.at(bucket.routing_bucket, *handle),
+        page,
+    );
     assert!(
         written.contains_key(&expected),
         "the dump must carry the rendered key {expected:?}, got {:?}",
@@ -7072,6 +7096,7 @@ fn a_bucket_holding_one_block_holds_no_node() {
     {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
+        let named = super::PageObjects::of(&shard.bucket_index);
         let bucket = shard
             .bucket_index
             .bucket_map
@@ -7079,8 +7104,8 @@ fn a_bucket_holding_one_block_holds_no_node() {
             .find(|bucket| {
                 bucket
                     .block_index
-                    .values()
-                    .any(|page| &*page.object_key == "wide")
+                    .iter()
+                    .any(|(handle, _)| &**named.at(bucket.routing_bucket, *handle) == "wide")
             })
             .expect("the remaining field must still be filed");
         // THE DEMOTION IS NOW DEFERRED, NOT DEAD, AND THIS IS WHAT DEFERS IT.
@@ -7178,6 +7203,7 @@ fn a_bucket_holding_one_block_holds_no_node() {
     {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
+        let named = super::PageObjects::of(&shard.bucket_index);
         let bucket = shard
             .bucket_index
             .bucket_map
@@ -7185,8 +7211,8 @@ fn a_bucket_holding_one_block_holds_no_node() {
             .find(|bucket| {
                 bucket
                     .block_index
-                    .values()
-                    .any(|page| &*page.object_key == "wide")
+                    .iter()
+                    .any(|(handle, _)| &**named.at(bucket.routing_bucket, *handle) == "wide")
             })
             .expect("the object must still be filed");
         let live = bucket.block_index.values().filter(|page| !page.deleted).count();
@@ -7233,6 +7259,7 @@ fn a_bucket_holding_one_block_holds_no_node() {
     {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
+        let named = super::PageObjects::of(&shard.bucket_index);
         let held: usize = shard
             .bucket_index
             .bucket_map
@@ -7240,8 +7267,10 @@ fn a_bucket_holding_one_block_holds_no_node() {
             .map(|bucket| {
                 bucket
                     .block_index
-                    .values()
-                    .filter(|page| &*page.object_key == "wide")
+                    .iter()
+                    .filter(|(handle, _)| {
+                        &**named.at(bucket.routing_bucket, **handle) == "wide"
+                    })
                     .count()
             })
             .sum();
@@ -7709,9 +7738,21 @@ fn block_index_identity_string_cardinality() {
     // report the cost as if nothing had changed -- every block still holds one, it just points at
     // a string it does not own.
     let mut model_allocations: HashSet<*const u8> = HashSet::new();
+    // THE OBJECT-KEY HALF IS COUNTED OVER THE LOOKUP AND ITS DENOMINATOR IS OBJECTS, NOT PAGES.
+    // It summed one `len` per PAGE off the entry's own copy. The entry has none; the text lives
+    // once per (kind, object) in the lookup, so that is what is walked and `objects` is what it
+    // is divided by. Both denominators are named at the point each ratio is printed, because a
+    // per-page figure and a per-object figure over the same bytes differ by the pages-per-object
+    // of whatever fixture is running.
     let mut distinct_keys: HashSet<&str> = HashSet::new();
+    let mut objects = 0usize;
     let mut model_bytes = 0usize;
     let mut key_bytes = 0usize;
+    for (_model, object, _refs) in shard.bucket_index.object_block_lookup.iter() {
+        objects += 1;
+        distinct_keys.insert(object.as_ref());
+        key_bytes += object.len();
+    }
     for bucket in shard.bucket_index.bucket_map.values() {
         for (_ref_key, page) in bucket.block_index.iter() {
             pages += 1;
@@ -7719,9 +7760,7 @@ fn block_index_identity_string_cardinality() {
             // One address per spelling for the whole process, and not an allocation: the entry
             // holds one byte and reads the registry's `&'static str` through it.
             model_allocations.insert(page.model_id.as_str().as_ptr());
-            distinct_keys.insert(page.object_key.as_ref());
             model_bytes += page.model_id.as_str().len();
-            key_bytes += page.object_key.len();
             // THE COMPONENT HALF OF THIS CENSUS HAS NO SUBJECT LEFT.
             //
             // It measured whether an entry's element name was a SHARED allocation -- distinct
@@ -7746,21 +7785,29 @@ fn block_index_identity_string_cardinality() {
     // true of every possible corpus, since an entry has no element name. A floor no fixture can
     // satisfy is not a floor; lowering it to zero would have been the move its own comment forbids.
     assert!(pages > 0, "the page index is empty; nothing was measured");
+    // AND THE LOOKUP NAMES SOMETHING, or the object-key row below is a row of zeroes that reads
+    // as "no key text in this store" instead of "the lookup was not walked".
+    assert!(
+        objects > 0,
+        "the object lookup names no object, so the key row below measures nothing"
+    );
 
     let share = |distinct: usize, copies: usize| {
         if distinct == 0 { 0.0 } else { copies as f64 / distinct as f64 }
     };
     println!(
         "
-  page index identity strings over {pages} pages:
-    model_id    {:>5} distinct, {:>6} holders ({:>7.1} each), {:>4} allocations behind {:>6} B of referenced text
-    object_key  {:>5} distinct, {:>6} copies  ({:>7.1} copies each, {:>6} B held)
+  page index identity strings:
+    over {pages} PAGES
+      model_id    {:>5} distinct, {:>6} holders ({:>7.1} each), {:>4} allocations behind {:>6} B of referenced text
+    over {objects} OBJECTS, in the lookup, which is where the key text now lives
+      object_key  {:>5} distinct, {:>6} slots   ({:>7.1} slots each, {:>6} B held)
 
-    BlockIndex is {} B before its heap strings
+    BlockIndex is {} B before its heap strings, and holds no key text at all
 ",
         distinct_models.len(), pages, share(distinct_models.len(), pages),
         model_allocations.len(), model_bytes,
-        distinct_keys.len(), pages, share(distinct_keys.len(), pages), key_bytes,
+        distinct_keys.len(), objects, share(distinct_keys.len(), objects), key_bytes,
         std::mem::size_of::<crate::engine::state::BlockIndex>(),
     );
 }
@@ -7996,19 +8043,15 @@ fn per_record_structure_census() {
     // 14.1 B of it, so knowing WHERE the key copies live says whether interning would pay and
     // which structure to attack first.
     let key_bytes: usize = shard.strings.keys().map(|key| key.len()).sum();
-    let block_index_bytes: usize = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.iter())
-        .map(|(_handle, page)| {
-            // The key is an inline number now, not text on the heap.
-            page.object_key.len()
-                // One byte inline and a `&'static str`: no heap text for the spelling.
-                + 0
-                + 0
-        })
-        .sum();
+    // ZERO, AND THE ROW IS KEPT BECAUSE THE TABLE IS A LIST OF PLACES. The page index held one
+    // `Arc<str>` of key text per entry. It holds none: no key, a one-byte kind spelled by a
+    // `&'static str`, and no element name. So this structure contributes no heap text, and the
+    // whole of its former contribution is the `block_lookup_bytes` row below -- once per object
+    // rather than once per page, which is the saving this change is.
+    //
+    // THE LOOKUP ROW IS FLOORED JUST BELOW, so a zero here cannot be read as "this fixture wrote
+    // no keys".
+    let block_index_bytes: usize = 0;
     // Outer keys plus the block-ref key each entry holds.
     let block_lookup_bytes: usize = shard
         .bucket_index
@@ -8030,6 +8073,14 @@ fn per_record_structure_census() {
     // name field is now deleted outright, so there is nothing left to sum. Leaving a hard zero in
     // a measurement table is worse than removing the row.
     let dirty_bytes: usize = shard.dirty_objects.iter().map(str::len).sum();
+    // THE FLOOR THE PAGE-INDEX ROW NEEDS. That row is a structural zero now, and a structural
+    // zero beside an unfloored lookup row is indistinguishable from a fixture that wrote no keys
+    // at all -- the table would read "no key text anywhere" and both halves of that would be
+    // wrong. This says the text IS held, and says it of the structure that now holds it.
+    assert!(
+        block_lookup_bytes > 0,
+        "the object lookup holds no key text over {RECORDS} records, so the zero in the page-index          row below cannot be read as a saving"
+    );
     let total_string_bytes =
         key_bytes + block_index_bytes + block_lookup_bytes + dirty_bytes;
     let sample_key_len = shard.strings.keys().next().map_or(0, |name| name.len());
@@ -8342,14 +8393,15 @@ fn bucket_object_index_already_matches_a_from_scratch_recompute() {
 
     let shards = engine.shards.read().expect("shards lock poisoned");
     let shard = shards.get(&1).expect("shard 1 loaded");
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut checked = 0usize;
     let mut mismatches = Vec::new();
     for (routing_bucket, bucket) in shard.bucket_index.bucket_map.iter() {
         let recomputed: std::collections::BTreeSet<u64> = bucket
             .block_index
-            .values()
-            .filter(|page| !page.deleted)
-            .map(|page| page.object_id(1))
+            .iter()
+            .filter(|(_, page)| !page.deleted)
+            .map(|(handle, page)| page.object_id(1, named.at(*routing_bucket, *handle)))
             .collect();
         // Mirrors update_bucket_layout: an empty live set over an empty block index leaves the
         // stored set untouched, so only compare where the rebuild would actually assign.
@@ -8398,7 +8450,16 @@ fn bucket_object_index_already_matches_a_from_scratch_recompute() {
         slot_arrays_compared += 1;
         placeholders_seen += before.iter().filter(|slot| slot.is_none()).count();
         let mut rebuilt = bucket.clone();
-        crate::engine::storage_bucket_internals::update_bucket_layout(1, &mut rebuilt);
+        // THE IDENTITIES COME FROM THE SHARD, because the rebuild no longer reads them off the
+        // pages. The bucket under test is a CLONE, so the shard is still only borrowed immutably
+        // here and `page_identities` -- which borrows the whole index -- is available; the
+        // production sweeps have to split the two field borrows by hand instead.
+        let page_keys = shard.bucket_index.page_identities();
+        crate::engine::storage_bucket_internals::update_bucket_layout(
+            1,
+            &mut rebuilt,
+            &page_keys,
+        );
         let after = slots_of(&rebuilt.object_index);
         if before != after {
             renumbered.push(format!("  bucket {routing_bucket}: {before:?} -> {after:?}"));
@@ -13760,15 +13821,16 @@ fn the_maintained_object_index_matches_a_full_rebuild() {
     let shard = shards.get(&1).expect("shard 1 loaded");
 
     let mut divergent = Vec::new();
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut checked = 0usize;
     let mut live_total = 0usize;
     for (routing_bucket, bucket) in shard.bucket_index.bucket_map.iter() {
         // What a rebuild would produce: the ids of the blocks that are not deleted.
         let rebuilt: crate::engine::state::ObjectIndex = bucket
             .block_index
-            .values()
-            .filter(|page| !page.deleted)
-            .map(|page| page.object_id(1))
+            .iter()
+            .filter(|(_, page)| !page.deleted)
+            .map(|(handle, page)| page.object_id(1, named.at(*routing_bucket, *handle)))
             .collect();
         checked += 1;
         live_total += rebuilt.object_count();
@@ -13901,12 +13963,11 @@ fn whether_a_context_block_reaches_the_bucket_index() {
         .keys()
         .filter(|key| key.contains("ctx") || key.contains("context"))
         .count();
-    let context_blocks_in_index: usize = shard
-        .bucket_index
-        .bucket_map
-        .values()
-        .flat_map(|bucket| bucket.block_index.values())
-        .filter(|page| page.object_key.contains("ctx") || page.object_key.contains("context"))
+    let context_blocks_in_index: usize = super::pages_with_identity(&shard.bucket_index)
+        .into_iter()
+        .filter(|(_, _, object_key, _)| {
+            object_key.contains("ctx") || object_key.contains("context")
+        })
         .count();
 
     println!(
@@ -13981,13 +14042,19 @@ fn what_one_block_costs_to_index() {
             entries += 1;
             // The map key is an inline number now, not a rendered string on the heap.
             ref_key_bytes += 0;
-            // Shared with the lookup, so one allocation answers for both holders.
-            object_key_bytes += page.object_key.len();
+            // AND NEITHER IS THE OBJECT KEY. This read `page.object_key.len()` and called it
+            // "shared with the lookup, so one allocation answers for both holders" -- which was
+            // true of the allocation and wrong as a PER-ENTRY charge: it summed the same bytes
+            // once for every page of the object. The entry holds no key now, so the charge is
+            // zero here and the bytes are attributed once per object where they live, in
+            // `the_key_text_lives_in_four_structures`'s lookup row.
+            object_key_bytes += 0;
             // One allocation across every block of that component, not one per block. The kind
             // contributes nothing at all now: one byte inline, spelled by a `&'static str`.
             // An entry carries no element name, so it contributes no shared name bytes.
                     shared_bytes += 0;
-            heap += page.object_key.len();
+            heap += 0;
+            let _ = page;
         }
     }
     assert!(entries > 0, "the workload must produce pages, or this measures nothing");
@@ -14018,9 +14085,33 @@ fn what_one_block_costs_to_index() {
 
     // A report, not a threshold -- the point is the gap and where it comes from, and a bound here
     // would fail on unrelated changes. What must hold is that the measurement happened.
+    //
+    // AND THE FLOOR HAD TO MOVE OFF THE ENTRY, BECAUSE THE ENTRY IS THE ZERO NOW. It read
+    // `per_entry_heap > 0.0`, with the reason "every entry owns at least an object key, so zero
+    // heap means the walk found nothing". The entry owns no object key: `per_entry_heap` is a
+    // STRUCTURAL zero, and the old floor turned the finding into a failure.
+    //
+    // THE SAME TABLE'S SIBLING WAS FLOORED AND THIS ONE WAS MISSED, which is what makes it worth
+    // the words. `the_key_text_lives_in_four_structures` has the identical shape -- a page-index
+    // row gone to zero -- and it asserts the LOOKUP row is non-zero so the zero cannot be read as
+    // "this fixture wrote no keys". This floor was left pointing at the row that went to zero, and
+    // only running it said so: a structural zero and an empty walk are indistinguishable from
+    // inside the row itself.
+    //
+    // SO IT ASKS THE TWO QUESTIONS SEPARATELY. That entries were walked at all is asserted above
+    // on `entries`, which is the "did the measurement happen" half. What this adds is that the key
+    // text is held SOMEWHERE in this store -- in the object lookup, which is where it moved -- so
+    // a run over a store that genuinely wrote no keys still fails.
+    let lookup_key_bytes: usize = shard
+        .bucket_index
+        .object_block_lookup
+        .iter()
+        .map(|(_model, object, _refs)| object.len())
+        .sum();
     assert!(
-        per_entry_heap > 0.0,
-        "every entry owns at least an object key, so zero heap means the walk found nothing"
+        lookup_key_bytes > 0,
+        "the object lookup holds no key text, so the {per_entry_heap:.1} B of per-entry heap above \
+         cannot be read as the entry having given its key up -- this store never had one"
     );
 }
 
@@ -14165,17 +14256,19 @@ fn which_parts_of_a_block_address_restate_their_surroundings() {
     let shards = engine.shards.read().expect("shards lock poisoned");
     let shard = shards.get(&1).expect("shard 1 loaded");
 
+    let named = super::PageObjects::of(&shard.bucket_index);
     let mut pages = 0usize;
     let mut routing_matches_bucket = 0usize;
     for (bucket_key, bucket) in shard.bucket_index.bucket_map.iter() {
-        for page in bucket.block_index.values() {
+        for (handle, _page) in &bucket.block_index {
             pages += 1;
             // WHERE THE BLOCK IS, against where its KEY routes. This used to compare the
             // address's own copy of its bucket against the bucket holding it -- a comparison
             // between a value and the expression that wrote it. The address carries no bucket, so
             // the comparison is now between the container and the derivation, which is the one
             // form of it that can disagree.
-            if block_routing_bucket(&page.object_key, 0, u32::MAX) == *bucket_key {
+            if block_routing_bucket(named.at(*bucket_key, *handle), 0, u32::MAX) == *bucket_key
+            {
                 routing_matches_bucket += 1;
             }
             // `object_id_matches_entry` STOOD HERE and has gone with the field. It compared the
@@ -14270,21 +14363,17 @@ fn maintaining_the_index_during_ingest_matches_rebuilding_it() {
     let held: std::collections::BTreeMap<(u32, String), (String, String, Option<String>)> = {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        shard
-            .bucket_index
-            .bucket_map
-            .iter()
-            .flat_map(|(bucket, node)| {
-                node.block_index.iter().map(move |(ref_key, page)| {
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(bucket, handle, object_key, page)| {
+                (
+                    (bucket, handle.to_string()),
                     (
-                        (*bucket, ref_key.to_string()),
-                        (
-                            page.model_id.to_string(),
-                            page.object_key.to_string(),
-                            None::<String>,
-                        ),
-                    )
-                })
+                        page.model_id.to_string(),
+                        object_key.to_string(),
+                        None::<String>,
+                    ),
+                )
             })
             .collect()
     };
@@ -14304,21 +14393,17 @@ fn maintaining_the_index_during_ingest_matches_rebuilding_it() {
     let rebuilt: std::collections::BTreeMap<(u32, String), (String, String, Option<String>)> = {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        shard
-            .bucket_index
-            .bucket_map
-            .iter()
-            .flat_map(|(bucket, node)| {
-                node.block_index.iter().map(move |(ref_key, page)| {
+        super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(bucket, handle, object_key, page)| {
+                (
+                    (bucket, handle.to_string()),
                     (
-                        (*bucket, ref_key.to_string()),
-                        (
-                            page.model_id.to_string(),
-                            page.object_key.to_string(),
-                            None::<String>,
-                        ),
-                    )
-                })
+                        page.model_id.to_string(),
+                        object_key.to_string(),
+                        None::<String>,
+                    ),
+                )
             })
             .collect()
     };
@@ -15954,19 +16039,10 @@ fn a_no_block_command_leaves_the_index_matching_a_rebuild() {
     let snapshot = |engine: &TemporalEngine| -> Vec<String> {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        let mut rows: Vec<String> = shard
-            .bucket_index
-            .bucket_map
-            .iter()
-            .flat_map(|(routing_bucket, bucket)| {
-                bucket.block_index.values().map(move |page| {
-                    format!(
-                        "{routing_bucket}|{}|{}|{}",
-                        page.model_id,
-                        page.object_key,
-                        "-"
-                    )
-                })
+        let mut rows: Vec<String> = super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(routing_bucket, _handle, object_key, page)| {
+                format!("{routing_bucket}|{}|{}|{}", page.model_id, object_key, "-")
             })
             .collect();
         rows.sort();
@@ -16074,19 +16150,10 @@ fn a_no_block_command_in_a_batch_does_not_rebuild_the_index() {
     let block_rows = |engine: &TemporalEngine| -> Vec<String> {
         let shards = engine.shards.read().expect("shards lock poisoned");
         let shard = shards.get(&1).expect("shard 1 loaded");
-        let mut rows: Vec<String> = shard
-            .bucket_index
-            .bucket_map
-            .iter()
-            .flat_map(|(routing_bucket, bucket)| {
-                bucket.block_index.values().map(move |page| {
-                    format!(
-                        "{routing_bucket}|{}|{}|{}",
-                        page.model_id,
-                        page.object_key,
-                        "-"
-                    )
-                })
+        let mut rows: Vec<String> = super::pages_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(routing_bucket, _handle, object_key, page)| {
+                format!("{routing_bucket}|{}|{}|{}", page.model_id, object_key, "-")
             })
             .collect();
         rows.sort();
@@ -19261,26 +19328,22 @@ fn a_released_bucket_reloads_the_exact_block_list_it_released() {
 
     fn block_listing(engine: &TemporalEngine) -> Vec<(u32, String, String, Option<String>, u64, u64, u64)> {
         let shards = engine.shards.read().expect("shards lock poisoned");
-        let mut rows = shards
-            .get(&1)
-            .expect("loaded shard")
-            .bucket_index
-            .bucket_map
-            .iter()
-            .flat_map(|(routing_bucket, bucket)| {
-                bucket.block_index.values().map(move |page| {
-                    (
-                        *routing_bucket,
-                        page.model_id.to_string(),
-                        page.object_key.to_string(),
-                        None::<String>,
-                        page.address.block_slab_id(),
-                        page.address.offset(),
-                        page.address.length(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut rows = super::pages_with_identity(
+            &shards.get(&1).expect("loaded shard").bucket_index,
+        )
+        .into_iter()
+        .map(|(routing_bucket, _handle, object_key, page)| {
+            (
+                routing_bucket,
+                page.model_id.to_string(),
+                object_key.to_string(),
+                None::<String>,
+                page.address.block_slab_id(),
+                page.address.offset(),
+                page.address.length(),
+            )
+        })
+        .collect::<Vec<_>>();
         rows.sort();
         rows
     }

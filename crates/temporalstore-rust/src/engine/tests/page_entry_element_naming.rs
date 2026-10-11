@@ -773,15 +773,17 @@ fn a_hash_page_naming_no_field_is_skipped_while_a_genuine_empty_field_name_is_ke
     // leaves the key out entirely and reads back as `None` -- an absent component round-trips as a
     // STABLE shape rather than as damage.
     let nameless_entry = BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 7,
         object_key: Arc::from("ef-wire-probe"),
         model_id: stored_model_kind("hash"),
         address: ElementEntry::default(),
         dirty: false,
         deleted: false,
     };
-    let encoded = serde_json::to_string(&nameless_entry).expect("a page entry serializes");
+    let encoded = serde_json::to_string(&crate::engine::state::PageEntryAt {
+        page: &nameless_entry,
+        object_key: "ef-wire-probe",
+    })
+    .expect("a page entry serializes");
     assert!(
         encoded.len() > 32,
         "the encoded page entry is {} B, too short for the absence assertion below to mean anything",
@@ -792,8 +794,10 @@ fn a_hash_page_naming_no_field_is_skipped_while_a_genuine_empty_field_name_is_ke
         "a component-less page entry still wrote a component key, so the absent shape this finding \
          rests on is not what the encoder produces: {encoded}"
     );
-    let decoded: BlockIndex =
-        serde_json::from_str(&encoded).expect("a component-less page entry decodes");
+    let decoded = serde_json::from_str::<crate::engine::state::StoredPageEntry>(&encoded)
+        .expect("a component-less page entry decodes")
+        .into_parts()
+        .1;
     // THE DECODER CANNOT ADMIT A NAME INTO AN ENTRY ANY MORE, so this assertion is gone.
     //
     // It decoded a component-less entry and asserted the decoded value carried no component, to
@@ -1340,13 +1344,19 @@ fn the_stored_page_handle_decides_nothing_the_fold_files() {
             std::slice::from_ref(&item),
             false,
         );
+        let named = super::PageObjects::of(&index);
         let mut rows = Vec::new();
         for bucket in index.bucket_map.values() {
             for (allocated, page) in bucket.block_index.iter() {
                 rows.push((
-                    page.routing_bucket,
+                    // FROM THE NODE, WHICH IS WHERE THE BUCKET LIVES. This read
+                    // `page.routing_bucket` until that field left the entry in
+                    // `65c7fc562`; it is the same number, taken from the structure
+                    // that still holds it, so the census row is unchanged. The object
+                    // key is the same move one field later.
+                    bucket.routing_bucket,
                     page.model_id.as_str().to_string(),
-                    page.object_key.as_ref().to_string(),
+                    named.at(bucket.routing_bucket, *allocated).as_ref().to_string(),
                     page.address.block_slab_id(),
                     page.address.offset(),
                     page.address.length(),

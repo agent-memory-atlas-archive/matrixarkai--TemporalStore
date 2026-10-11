@@ -339,9 +339,17 @@ impl TemporalEngine {
         if fold_deltas {
             self.fold_index_log_deltas(shard_id, &mut shard)?;
         }
-        // object_*_lookup is a derived serving accelerator and is no longer persisted;
-        // rebuild it before reconcile/promotion and before returning a loaded shard.
-        shard.bucket_index.rebuild_object_block_lookup();
+        // object_*_lookup is a derived serving accelerator and is no longer persisted -- and it
+        // is MAINTAINED now rather than rebuilt here. The decoder files each page as it decodes,
+        // and the delta fold above files what it places and un-files what it drops, so by this
+        // line the lookup already describes the index and the whole-shard rebuild that stood here
+        // had nothing left to discover.
+        //
+        // The claim is checked instead of taken: see
+        // [`CoreIndex::debug_assert_lookup_matches_the_pages`] for why it is answerable without
+        // doing the pass, and why it is a scaffold with a lifetime.
+        #[cfg(debug_assertions)]
+        shard.bucket_index.debug_assert_lookup_matches_the_pages();
         // No base and nothing to fold -> genuinely nothing persisted yet.
         if !base_present
             && shard.bucket_index.bucket_map.is_empty()
@@ -483,10 +491,27 @@ impl TemporalEngine {
             ));
         }
         if applied {
-            for bucket in shard.bucket_index.bucket_map.values_mut() {
-                update_bucket_layout(shard_id, bucket);
+            // THE LOOKUP IS REBUILT BEFORE THE LAYOUT PASS NOW, NOT AFTER IT.
+            //
+            // The pass below derives each bucket's live object set from the identity held beside
+            // its pages, and the lookup IS that identity -- so it has to describe the index AS
+            // FOLDED. It does: the fold files what it places and un-files what it drops, in that
+            // order, so there is no window between the fold and this pass in which a position
+            // names a page that has gone or a page has no position. A whole-shard rebuild stood
+            // here to close that window and is no longer closing anything.
+            #[cfg(debug_assertions)]
+            shard.bucket_index.debug_assert_lookup_matches_the_pages();
+            // THE INVERSION IS HOISTED, AND THE TWO BORROWS ARE SPLIT BY NAMING THE FIELDS. The derive
+            // reads the object lookup while this loop holds the bucket map mutably, and both are fields of
+            // one index -- so the split has to be written where the places are named, rather than inside a
+            // method that would borrow the whole index. Built ONCE above a whole-shard pass, which is the
+            // order that pass already pays; built per bucket it would be that order per bucket.
+            let index = &mut shard.bucket_index;
+            let keys =
+                crate::engine::state::PageKeysByPosition::from_lookup(&index.object_block_lookup);
+            for bucket in index.bucket_map.values_mut() {
+                update_bucket_layout(shard_id, bucket, &keys);
             }
-            shard.bucket_index.rebuild_object_block_lookup();
             // AFTER the page index has settled, because this asks of every carried element whether
             // the fold left a page at its address -- a question only the finished index can answer.
             fold_carried_container_elements(shard, &carried_container_elements);

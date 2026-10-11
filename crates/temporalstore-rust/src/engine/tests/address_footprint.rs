@@ -1837,28 +1837,38 @@ fn the_capacity_ceilings_each_narrowing_would_impose() {
     let mut named: BTreeMap<String, (u64, bool)> = BTreeMap::new();
     let mut longest: Vec<(u64, String)> = Vec::new();
 
+    // EVERY ROW BELOW NAMES ITS OBJECT FROM THE STRUCTURE BESIDE THE PAGE. `identity_of` is
+    // used rather than the live-only inversion because this walk reports on DELETED pages too --
+    // two of its rows are about zero-length tombstones -- and a tombstone's object is named by
+    // the bucket's own removal row, not by the object lookup.
+    let keys = crate::engine::state::PageKeysByPosition::from_lookup(
+        &shard.bucket_index.object_block_lookup,
+    );
     for bucket in shard.bucket_index.bucket_map.values() {
         max_objects_in_a_bucket = max_objects_in_a_bucket.max(bucket.object_index.object_count());
         let mut blocks_here = 0usize;
-        for (_, page) in bucket.block_index.iter() {
+        for (handle, page) in bucket.block_index.iter() {
             blocks_here += 1;
             model_ids.insert(page.model_id.to_string());
-            *blocks_per_object.entry(page.object_id(1)).or_default() += 1;
+            let named_key = keys
+                .identity_of(bucket, *handle, page)
+                .map(|beside| std::sync::Arc::clone(beside.object_key))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the page at handle {handle} is named by nothing beside it, so this                          footprint report has no object to attribute it to"
+                    )
+                });
+            *blocks_per_object.entry(page.object_id(1, &named_key)).or_default() += 1;
             max_length = max_length.max(page.address.length());
             max_page_id = max_page_id.max(page.address.block_id().unwrap_or(0));
-            longest.push((page.address.length(), page.object_key.to_string()));
-            if page.object_key.as_ref() == "big_value" || page.object_key.as_ref() == "empty_value"
-            {
-                named.insert(
-                    page.object_key.to_string(),
-                    (page.address.length(), page.deleted),
-                );
+            longest.push((page.address.length(), named_key.to_string()));
+            if named_key.as_ref() == "big_value" || named_key.as_ref() == "empty_value" {
+                named.insert(named_key.to_string(), (page.address.length(), page.deleted));
             }
             if !page.deleted {
                 live_blocks += 1;
                 if page.address.length() == 0 {
-                    live_zero_length
-                        .push((page.model_id.to_string(), page.object_key.to_string()));
+                    live_zero_length.push((page.model_id.to_string(), named_key.to_string()));
                 }
             } else if page.address.length() == 0 {
                 deleted_zero_length += 1;
@@ -2565,6 +2575,19 @@ fn two_buckets_holding_one_object_id_are_reported_as_one_object() {
     // The same object id filed in two different buckets. Reachable without any tampering: the
     // routing range is the MODULUS, so a store re-ranged between writes files one key's blocks under
     // two buckets, and `bucket_map` holds both.
+    // AND THE LOOKUP IS FILED, WHICH IS WHAT THE REPORT NOW READS THE IDENTITY FROM.
+    //
+    // `runtime_report` used to fall back to the entry's own copy for a live page nothing named,
+    // under a note calling that fallback "a scaffold with a lifetime" whose answer was that "the
+    // lookup must be established before this report walks". The fallback is gone, so this fixture
+    // has to establish it -- and it CAN, which that note doubted: it said the fixture cannot file
+    // a lookup entry because `BlockIndexMap::insert` cannot reach a `CoreIndex`. True of that
+    // method, and beside the point: `CoreIndex::insert_object_block_lookup` is reachable from
+    // here, and it is the door every production placement goes through.
+    //
+    // The handle is read back out of the map rather than recomputed, so the lookup records the
+    // position the map actually filed the page under.
+    let key: std::sync::Arc<str> = std::sync::Arc::from("one-key");
     for (routing_bucket, offset) in [(11u32, 0u64), (2_222u32, 4_096u64)] {
         let mut bucket = BucketNode {
             routing_bucket,
@@ -2572,9 +2595,8 @@ fn two_buckets_holding_one_object_id_are_reported_as_one_object() {
         };
         bucket.object_index.insert(object_id);
         bucket.block_index.insert(
+            &"one-key",
             BlockIndex {
-                kind: crate::index_log::IndexItemKind::Page,
-                routing_bucket: routing_bucket,
                 object_key: std::sync::Arc::from("one-key"),
                 model_id: crate::engine::storage_bucket_internals::StoredModelKind::String,
                 address: ElementEntry::from_parts(1, offset, 64, Some(0), None),
@@ -2583,7 +2605,17 @@ fn two_buckets_holding_one_object_id_are_reported_as_one_object() {
             },
             &mut Default::default(),
         );
+        let placed: Vec<(u64, BlockIndex)> = bucket
+            .block_index
+            .iter()
+            .map(|(handle, page)| (*handle, page.clone()))
+            .collect();
         shard.bucket_index.bucket_map.insert(routing_bucket, bucket);
+        for (handle, page) in &placed {
+            shard
+                .bucket_index
+                .insert_object_block_lookup(routing_bucket, *handle, &key, page);
+        }
     }
 
     // DENOMINATOR: the fixture really does hold the id twice, in two buckets.

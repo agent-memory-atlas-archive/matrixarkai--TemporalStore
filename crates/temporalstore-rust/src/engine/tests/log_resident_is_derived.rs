@@ -89,8 +89,6 @@ fn the_log_resident_fact_is_derived_from_the_address_alone() {
 
     // The entry the tombstone path builds. It no longer carries a log-resident flag to get wrong.
     let tombstone = BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 7,
         object_key: std::sync::Arc::from("tenant/7/object/1"),
         model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
         address: in_log.clone(),
@@ -149,8 +147,6 @@ fn the_log_resident_fact_is_derived_from_the_address_alone() {
 fn the_stored_entry_has_dropped_the_flag_and_gained_no_key() {
 
     let page = BlockIndex {
-        kind: crate::index_log::IndexItemKind::Page,
-        routing_bucket: 7,
         object_key: std::sync::Arc::from("tenant/7/object/1"),
         model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
         address: ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None),
@@ -158,7 +154,12 @@ fn the_stored_entry_has_dropped_the_flag_and_gained_no_key() {
         deleted: false,
     };
 
-    let encoded = serde_json::to_string(&page).expect("a page entry serializes");
+    // THROUGH THE WRAPPER, BECAUSE THE ENTRY HAS NO ENCODER OF ITS OWN. `object_key` is a
+    // serialized member and a derive can only read it off the entry, so the identity is named
+    // here -- by this fixture, which is the only thing that knows it -- and injected beside the
+    // page. These bytes are character-for-character the ones the derive wrote.
+    let named = crate::engine::state::PageEntryAt { page: &page, object_key: "tenant/7/object/1" };
+    let encoded = serde_json::to_string(&named).expect("a page entry serializes");
     println!("[log-resident] stored entry: {encoded}");
 
     assert!(
@@ -180,7 +181,9 @@ fn the_stored_entry_has_dropped_the_flag_and_gained_no_key() {
     // `deleted` change it cannot see a key leave either, and the assertions above would pass over
     // anything.
     let flipped = BlockIndex { deleted: true, ..page.clone() };
-    let flipped_encoded = serde_json::to_string(&flipped).expect("serializes");
+    let flipped_encoded =
+        serde_json::to_string(&crate::engine::state::PageEntryAt { page: &flipped, object_key: "tenant/7/object/1" })
+            .expect("serializes");
     assert_ne!(
         encoded, flipped_encoded,
         "CONTROL: flipping a surviving stored field must change the bytes, or this test cannot \
