@@ -318,6 +318,115 @@ pub(crate) mod restore_phase_probe {
     }
 }
 
+/// Counts of the times a replay had to fall back to the recorded outcome's own element name,
+/// because the page could not be asked.
+///
+/// A DETECTOR ON A FALLBACK, WHICH IS THE ONE SHAPE WORTH COUNTING. The page is meant to be the
+/// authority; every one of these is a write whose page cannot name its own element, so the count is
+/// the size of the class that still depends on the outcome carrying the name. It is also what says
+/// whether a test exercised the fallback at all -- a fallback nothing reaches is a fallback nothing
+/// has checked.
+static OUTCOME_NAME_FROM_PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OUTCOME_NAME_FROM_COMPONENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static OUTCOME_NAME_DISAGREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (from the page, from the outcome's own copy, refused for disagreeing).
+pub fn outcome_element_name_sources() -> (u64, u64, u64) {
+    (
+        OUTCOME_NAME_FROM_PAGE.load(std::sync::atomic::Ordering::Relaxed),
+        OUTCOME_NAME_FROM_COMPONENT.load(std::sync::atomic::Ordering::Relaxed),
+        OUTCOME_NAME_DISAGREED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Reset the three, so a test measures its own replays and not another test's.
+pub fn reset_outcome_element_name_sources() {
+    OUTCOME_NAME_FROM_PAGE.store(0, std::sync::atomic::Ordering::Relaxed);
+    OUTCOME_NAME_FROM_COMPONENT.store(0, std::sync::atomic::Ordering::Relaxed);
+    OUTCOME_NAME_DISAGREED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the page an outcome names could say about its own elements.
+///
+/// `Unreadable` carries WHY, because the reason is what the refusal message has to print and what
+/// the next reader of a failed load needs. An `Option` here lost it once already.
+enum OutcomePageElements {
+    /// The frame named these elements, with each one's removed flag.
+    Named(Vec<(String, bool)>),
+    /// The page could not be asked, for this reason.
+    Unreadable(&'static str),
+}
+
+impl OutcomePageElements {
+    fn why(&self) -> &'static str {
+        match self {
+            OutcomePageElements::Named(_) => "names its elements",
+            OutcomePageElements::Unreadable(why) => why,
+        }
+    }
+
+    /// THE PRECEDENCE, IN ONE PLACE: the page first, the outcome's own copy as the fallback, and a
+    /// refusal only when neither can name the element or when both can and they DISAGREE.
+    ///
+    /// # WHY THE PAGE WINS WHERE IT CAN ANSWER
+    ///
+    /// It is the durable statement of what the page holds, and it is the thing a later derivation
+    /// will read. Where it answers, nothing else is needed.
+    ///
+    /// # WHY THE OUTCOME'S COPY IS A FALLBACK AND NOT DEAD
+    ///
+    /// Because there are reachable writes whose page cannot name its element -- `--bins`'
+    /// `matrixark_publish_visibility_can_target_only_written_keys` is one, and the first version of
+    /// this code refused its load rather than reading a name that was sitting in the record. A
+    /// fallback is not a guess: the outcome's copy is what the write itself recorded about the
+    /// element it was about.
+    ///
+    /// # AND A DISAGREEMENT IS LOUD, WHICH IS THE CLAUSE THAT EARNS ITS KEEP
+    ///
+    /// If the page names elements and the outcome's component is not among them, then the page in
+    /// hand is not the page this outcome is about -- which is the `object_id` pairing defect
+    /// recorded in `the_shared_install_pairs_a_carried_page_to_an_outcome_by_an_id_that_cannot_discriminate`
+    /// arriving with evidence. Installing the page's names would file this element's address under
+    /// another element's name; installing the component's would file another page's bytes under
+    /// this one. Both are corruption, so neither is chosen and the load is refused.
+    ///
+    /// `want_removed` selects the half the caller is about: an insert installs the LIVE items, a
+    /// removal drops the ones the frame marks gone. The disagreement check looks at ALL of them,
+    /// because the component names its element whichever state the page records it in.
+    fn element_names(
+        &self,
+        item: &crate::wal::WalOutcomeItem,
+        want_removed: bool,
+    ) -> Option<Vec<String>> {
+        match self {
+            OutcomePageElements::Named(named) => {
+                if let Some(component) = item.component.as_deref() {
+                    if !named.iter().any(|(name, _)| name == component) {
+                        OUTCOME_NAME_DISAGREED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+                }
+                let wanted: Vec<String> = named
+                    .iter()
+                    .filter(|(_, removed)| *removed == want_removed)
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if wanted.is_empty() {
+                    return None;
+                }
+                OUTCOME_NAME_FROM_PAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(wanted)
+            }
+            OutcomePageElements::Unreadable(_) => {
+                let component = item.component.clone()?;
+                OUTCOME_NAME_FROM_COMPONENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(vec![component])
+            }
+        }
+    }
+}
+
 impl TemporalEngine {
     pub fn new(cache: MultiLayerCache) -> Self {
         Self::with_cache_and_block_store(cache, BlockStore::default())
@@ -1458,7 +1567,7 @@ impl TemporalEngine {
         }
         if localised
             .iter()
-            .any(|item| !self.apply_outcome_item(shard_id, item))
+            .any(|item| !self.apply_outcome_item(shard_id, item, carried))
         {
             return false;
         }
@@ -1470,11 +1579,173 @@ impl TemporalEngine {
         true
     }
 
+    /// Which elements the page an outcome names actually holds, read from the PAGE -- or WHY it
+    /// could not be asked.
+    ///
+    /// # THE PAGE IS THE AUTHORITY FOR WHAT ELEMENT IT HOLDS, AND IT IS NOT ALWAYS AVAILABLE
+    ///
+    /// A container page states its own elements -- `container_pages` is the module that made it do
+    /// so, and its own doc says why: "the element name now exists in a second place, which is the
+    /// precondition for it leaving the first." Replay used to ask the RECORDED OUTCOME which
+    /// element its page was about; it asks the page.
+    ///
+    /// AND THE FIRST VERSION OF THIS RETURNED AN `Option`, WHICH LOST THE ONE THING THE CALLER
+    /// NEEDED. A `None` meant "no element name from here" and the arms turned it straight into a
+    /// refused LOAD -- so a reachable path where the page cannot answer and the OUTCOME CAN became
+    /// a store that would not open. `--bins`' `matrixark_publish_visibility_can_target_only_written_keys`
+    /// found exactly that, and the message it printed is the shape of the defect: "address
+    /// resolved, page UNREADABLE or names nothing, component present, 27 chars". The information
+    /// was sitting right there and the refusal threw it away. So this answers with a REASON, and
+    /// the arms fall back to the outcome's own copy rather than refusing.
+    ///
+    /// # WHAT THAT FAILURE ACTUALLY WAS, MEASURED, AND IT IS NOT WHAT IT LOOKED LIKE
+    ///
+    /// "The page names nothing" reads as a missing frame, and the first reading of it here was that
+    /// some write path stores an unframed page -- `container_pages::UNFRAMED_CONTAINER_WRITES`
+    /// exists for exactly that class, so it was a plausible cause. IT WAS WRONG. The pages are
+    /// framed. Driven from the proxy binary's own suite with a temporary print on this arm, 24 of
+    /// 24 fallbacks reported:
+    ///
+    /// ```text
+    ///     kind=hash  component=Some(27)
+    ///     why=the record carries several pages of this object, so the carried page cannot be
+    ///         told apart, and the address is not in the block store
+    /// ```
+    ///
+    /// So BOTH ways of reaching the page failed at once, and neither is about the frame:
+    ///
+    ///   * the record is a `HashMultiSet` of several fields of ONE key, so it carries several pages
+    ///     under one `object_id` and the carried page cannot be matched to this outcome -- the
+    ///     pairing defect `the_shared_install_pairs_a_carried_page_to_an_outcome_by_an_id_that_cannot_discriminate`
+    ///     records, arriving in the wild rather than in a fixture;
+    ///   * and that test runs with ASYNC STORAGE on, so the block the address names was still
+    ///     buffered and the store did not have it.
+    ///
+    /// THE ELEMENT NAME WAS IN THE PAGE THE WHOLE TIME. What replay could not do is lay hands on
+    /// the page. That changes what this fallback is for: it does not cover pages that cannot name
+    /// their element, it covers pages this replay cannot reach -- and the durable fix is to make a
+    /// carried page identifiable, not to add frames to anything.
+    ///
+    /// IT ALSO CORRECTS A FIGURE THIS CAMPAIGN PUBLISHED. "0 block reads, structurally zero,
+    /// because `stage` is unconditional" was measured on single-page records and is true of them.
+    /// `stage` being unconditional says a page is CARRIED; it says nothing about whether the
+    /// carried page can be told apart from its siblings, and nothing about whether the address is
+    /// readable yet. A targeted fixture could not see either, and the proxy suite did -- which is
+    /// the recorded lesson that a targeted run is not a suite.
+    ///
+    /// NOT A SUBSTRING, A DECODE. The bytes were already known to CONTAIN the name -- a probe found
+    /// it in 3 of 3 payloads by searching for it -- and that is a weaker claim than it looks:
+    /// present is not the same as recoverable. What makes this sound is that the page carries a
+    /// one-byte KEY SPELLING and `component_from_element_key` is a defined inverse of the rendering
+    /// the write path used, driven both ways by `container_page_element_key`.
+    ///
+    /// # WHERE THE BYTES COME FROM, AND WHY THE ORDER IS THIS ONE
+    ///
+    /// THE CARRIED PAGE FIRST, AND ONLY WHEN IT IS UNAMBIGUOUS. `stage` is unconditional -- its own
+    /// doc says the flag that gated it is gone -- so every page a write produces travels inside its
+    /// record, and replay has already deserialized them. Taking the name from there costs NO BLOCK
+    /// READ AT ALL, and the baseline it has to beat is zero: measured, a cold replay of 64 records
+    /// performs 0 block reads.
+    ///
+    /// But a `StagedBlock` is keyed by `object_id`, and an object id is per (kind, key) and NOT per
+    /// element -- its own doc records what that costs ("two pages of one key sharing an id serve 1
+    /// of 2 correctly"). So a record carrying SEVERAL pages of one key cannot say which of them an
+    /// outcome is about, and guessing is how a replay installs a field name against another field's
+    /// address. The carried page is therefore used only when exactly ONE of the record's pages
+    /// belongs to this outcome's object.
+    ///
+    /// THE ADDRESS SECOND, WHICH IS EXACT AND COSTS A READ. `item.address` names one page and no
+    /// other, so reading it can never pick the wrong one. It is the fallback rather than the rule
+    /// because a read per replayed record is recovery time, and recovery time is a product
+    /// property: `durable_outranks_derived::what_resolving_the_element_from_the_page_costs_a_replay`
+    /// prices both arms. AND IT CAN FAIL: an asynchronous write leaves its block buffered, so the
+    /// address can name bytes the block store does not have yet, which is one of the ways this
+    /// answers `Unreadable` rather than naming anything.
+    fn elements_the_outcome_page_holds(
+        &self,
+        item: &crate::wal::WalOutcomeItem,
+        carried: &[crate::wal::StagedBlock],
+    ) -> OutcomePageElements {
+        let Some(spelling) = super::container_pages::ElementKeySpelling::for_kind(&item.kind) else {
+            return OutcomePageElements::Unreadable("this kind has no element-key page");
+        };
+        let Some(address) = item.resolved_address() else {
+            return OutcomePageElements::Unreadable("the outcome names no address");
+        };
+        let mut of_this_object = carried
+            .iter()
+            .filter(|page| page.object_id == item.object_id);
+        let bytes = match (of_this_object.next(), of_this_object.next()) {
+            (Some(only), None) => only.bytes.clone(),
+            // READ THROUGH THE STORE AND NOT THE READ FUNNEL, deliberately. The funnel resolves a
+            // log-resident page through `wal_resident_blocks`, which is keyed by (object id,
+            // ELEMENT NAME) -- so asking it would need the very name this is recovering. The store
+            // is keyed by the address, which the outcome has.
+            (Some(_), Some(_)) => match self.block_store.read(&address) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return OutcomePageElements::Unreadable(
+                        "the record carries several pages of this object, so the carried page \
+                         cannot be told apart, and the address is not in the block store",
+                    )
+                }
+            },
+            (None, _) => match self.block_store.read(&address) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return OutcomePageElements::Unreadable(
+                        "the record carries no page for this object and the address is not in the \
+                         block store",
+                    )
+                }
+            },
+        };
+        match super::container_pages::decode_container_page(&bytes) {
+            super::container_pages::ContainerPageDecode::Framed {
+                spelling: written, items, ..
+            } if written == spelling => {
+                let mut named = Vec::with_capacity(items.len());
+                for element in &items {
+                    match super::container_pages::component_from_element_key(written, &element.key) {
+                        Some(component) => named.push((component, element.deleted)),
+                        None => {
+                            return OutcomePageElements::Unreadable(
+                                "a page key does not render back as a component",
+                            )
+                        }
+                    }
+                }
+                if named.is_empty() {
+                    // A FRAME NAMING NOTHING IS NOT AN EMPTY ANSWER. A page exists because a write
+                    // put an element on it, so a frame with no items is as unusable as no frame.
+                    return OutcomePageElements::Unreadable("the frame names no element");
+                }
+                OutcomePageElements::Named(named)
+            }
+            super::container_pages::ContainerPageDecode::Framed { .. } => {
+                OutcomePageElements::Unreadable("the frame's key spelling is not this kind's")
+            }
+            super::container_pages::ContainerPageDecode::NotFramed => {
+                OutcomePageElements::Unreadable("the page carries no frame")
+            }
+            super::container_pages::ContainerPageDecode::Corrupt(_) => {
+                OutcomePageElements::Unreadable("the frame could not be walked")
+            }
+        }
+    }
+
     pub(super) fn apply_outcome_item(
         &self,
         shard_id: ShardId,
         item: &crate::wal::WalOutcomeItem,
+        carried: &[crate::wal::StagedBlock],
     ) -> bool {
+        // RESOLVED BEFORE THE SHARD LOCK IS TAKEN, because it can read the block store and holding
+        // the shard write guard across an I/O would serialise every reader of the shard behind a
+        // replay. The arms below need no lock to decide they do not want it.
+        let page = self.elements_the_outcome_page_holds(item, carried);
+        let live = page.element_names(item, false);
+        let removed = page.element_names(item, true);
         let mut shards = self.shards.write().expect("engine lock poisoned");
         let Some(shard) = shards.get_mut(&shard_id) else {
             return false;
@@ -1496,7 +1767,33 @@ impl TemporalEngine {
             // to stage -- replay installs a removal that was already recorded, and staging another
             // would record the recovery as a write of its own.
             "string" | "hash" | "set" | "list" | "zset" if item.deleted => {
-                let component = item.component.clone();
+                // THE TOMBSTONE PAGE NAMES WHAT WAS REMOVED, so a removal reads its element the
+                // same way an insert does.
+                //
+                // `remove_container_element` appends `container_pages::tombstone_page(kind,
+                // component)` before it records anything, and the outcome carries THAT page's
+                // address -- the comment on the re-filing below already says the address travels
+                // for the entry's sake. The page it names is a frame whose item for the removed
+                // element has `deleted` set, which is the whole reason the v2 page shape exists.
+                // So the element the removal is about is readable from the page, and the recorded
+                // outcome does not have to spell it.
+                //
+                // A REMOVAL WITH NO TOMBSTONE PAGE IS REFUSED, and that is a deliberate narrowing
+                // rather than a gap left open. `tombstone_page` answers `None` for a kind with no
+                // element-key spelling and counts it, and the append can fail and is counted by
+                // `TOMBSTONE_APPEND_FAILURES`. In either case the removal was never recorded IN THE
+                // PAGES -- so a derivation after the replay would resurrect the element whatever
+                // this arm did with it. Refusing the load says so; installing from a name the
+                // outcome happened to carry would hide it. `"string"` is untouched: its page is its
+                // whole object, it has no element, and it never had a component.
+                // ONE REMOVAL AT A TIME, by taking the SINGLE removed element and refusing a
+                // page that names several. A tombstone page is written per removal and holds
+                // exactly one removed item; a frame naming two would mean one outcome stood for two
+                // removals, and dropping both from a record that recorded one is a guess.
+                let component = match removed.as_deref() {
+                    Some([only]) => Some(only.clone()),
+                    _ => None,
+                };
                 match (item.kind.as_str(), component.as_deref()) {
                     ("string", _) => {
                         super::mark_bucket_index_object_deleted(shard, &item.object_key);
@@ -1637,74 +1934,109 @@ impl TemporalEngine {
             // The component is what the map is keyed by, encoded. Each of these mirrors the
             // encoder that produced it; a wrong decode shows up as an equivalence failure, not
             // as a silently different shard.
+            // THE PAGE SAYS WHICH FIELD IT HOLDS, AND THE OUTCOME NO LONGER HAS TO.
+            //
+            // This arm read `item.component` -- the recorded outcome's own copy of the field name
+            // -- and refused when it was absent. It reads the page the outcome's address names
+            // instead, through `elements_the_outcome_page_holds`, which decodes the container frame
+            // and renders each element key back through the spelling the write path used.
+            //
+            // EVERY ELEMENT THE PAGE NAMES IS INSTALLED, not one, and that is a widening rather
+            // than a substitution. Under one entry a page a folded page backs SEVERAL fields at one
+            // address, and all of them resolve through it -- so installing the page's whole element
+            // set is what the resident map should hold, where the outcome's single name could only
+            // ever describe one of them. Measured on the shape a write actually produces: every
+            // staged page holds exactly ONE item, so on the common path this installs exactly what
+            // the previous arm did.
+            //
+            // A REMOVED ITEM IS SKIPPED AND NOT INSTALLED. The v2 page shape can say an element is
+            // gone, and `ContainerPageItem::deleted` is that statement; installing it would put
+            // back the element the page records the removal of, which is the resurrection the shape
+            // exists to prevent.
             "hash" => {
-                let (Some(address), Some(field)) = (item.resolved_address(), item.component.clone())
-                else {
+                let (Some(address), Some(fields)) = (item.resolved_address(), live.as_ref()) else {
                     return false;
                 };
-                super::recorded_map::install_element::<super::recorded_map::HashKind>(
-                    shard,
-                    shard_id,
-                    &item.object_key,
-                    Some(field.clone()),
-                    field,
-                    address.clone(),
-                    true,
-                    address,
-                );
+                for field in fields {
+                    super::recorded_map::install_element::<super::recorded_map::HashKind>(
+                        shard,
+                        shard_id,
+                        &item.object_key,
+                        Some(field.clone()),
+                        field.clone(),
+                        address.clone(),
+                        true,
+                        address.clone(),
+                    );
+                }
                 true
             }
-            // set: the component is the member, hex encoded.
+            // set: the PAGE spells the member, and the page's key IS the member.
+            //
+            // THE SAME MOVE AS THE HASH ARM AND ONE DEGREE MORE DIRECT. For `ElementKeySpelling::Hex`
+            // the element key stored in the page is the member's own bytes, and the component is
+            // `hex::encode` of them -- so the hex round trip below is undoing a rendering that only
+            // ever existed to put the member in a `String`. It is kept rather than short-circuited
+            // because `elements_the_outcome_page_holds` answers in components for every kind, which
+            // is what lets all four arms share one resolver instead of each decoding the frame its
+            // own way.
             "set" => {
-                let (Some(address), Some(component)) =
-                    (item.resolved_address(), item.component.clone())
-                else {
+                let (Some(address), Some(members)) = (item.resolved_address(), live.as_ref()) else {
                     return false;
                 };
-                let Ok(member) = hex::decode(&component) else {
-                    return false;
-                };
+                for component in members {
+                    let Ok(member) = hex::decode(component) else {
+                        return false;
+                    };
+                    let component = component.clone();
+                    let address = address.clone();
                 // RECORDED, NOT AN EXCEPTION. This arm re-files the block in the bucket index
                 // before installing, so it goes through the ordinary recorded path. Hash's
                 // `context_node` arm needed an exception because it installs and files nothing;
                 // this one does not, which is the per-kind difference worth noticing.
-                super::recorded_map::install_element::<super::recorded_map::SetKind>(
-                    shard,
-                    shard_id,
-                    &item.object_key,
-                    Some(component),
-                    member,
-                    address.clone(),
-                    true,
-                    address,
-                );
+                    super::recorded_map::install_element::<super::recorded_map::SetKind>(
+                        shard,
+                        shard_id,
+                        &item.object_key,
+                        Some(component),
+                        member,
+                        address.clone(),
+                        true,
+                        address,
+                    );
+                }
                 true
             }
-            // list: sixteen hex digits of the sequence, biased so the text sorts in list order.
+            // list: the PAGE spells the sequence, as sixteen hex digits of a biased word so the
+            // text sorts in list order.
             "list" => {
-                let (Some(address), Some(component)) =
-                    (item.resolved_address(), item.component.clone())
+                let (Some(address), Some(positions)) =
+                    (item.resolved_address(), live.as_ref())
                 else {
                     return false;
                 };
-                let Ok(biased) = u64::from_str_radix(&component, 16) else {
-                    return false;
-                };
-                let sequence = biased.wrapping_add(i64::MIN as u64) as i64;
+                for component in positions {
+                    let Ok(biased) = u64::from_str_radix(component, 16) else {
+                        return false;
+                    };
+                    let sequence = biased.wrapping_add(i64::MIN as u64) as i64;
+                    let component = component.clone();
+                    let address = address.clone();
                 // THE STANDALONE UPSERT IS GONE BECAUSE THE OPERATION DOES IT. Leaving both
                 // filed the record twice, which a replay would then install twice -- the mirror
                 // image of the defect the container exists to stop, and the compiler caught it as
                 // a moved `component` rather than as a double write.
-                super::recorded_map::install_element::<super::recorded_map::ListKind>(
-                    shard,
-                    shard_id,
-                    &item.object_key,
-                    Some(component),
-                    sequence,
-                    address.clone(),
-                    true,
-                    address,
-                );
+                    super::recorded_map::install_element::<super::recorded_map::ListKind>(
+                        shard,
+                        shard_id,
+                        &item.object_key,
+                        Some(component),
+                        sequence,
+                        address.clone(),
+                        true,
+                        address,
+                    );
+                }
                 true
             }
             // zset: the member in hex. THE SCORE NO LONGER RIDES THE COMPONENT -- it rides
@@ -1713,13 +2045,18 @@ impl TemporalEngine {
             // old does not exist, because this replay arm and the writer that feeds it moved in
             // the same change, and a value-less zset insert outcome is therefore always a replay
             // this arm cannot recover -- refuse rather than install a wrong score.
+            // zset: the PAGE spells the member. THE SCORE STILL COMES FROM THE OUTCOME, and that
+            // is deliberate rather than an oversight.
+            //
+            // The page's key for this spelling is eight bytes of biased score followed by the
+            // member, so the score IS in the page -- but `component_from_element_key` drops those
+            // eight bytes, because the component stopped spelling a score when zset collapsed to
+            // one entry a page. Reading the score back out of the key would mean this arm decoding
+            // the frame itself instead of going through the shared resolver, for a value the
+            // outcome already carries in `value`. The member is what was duplicated; the score was
+            // not.
             "zset" => {
-                let (Some(address), Some(component)) =
-                    (item.resolved_address(), item.component.clone())
-                else {
-                    return false;
-                };
-                let Ok(member) = hex::decode(&component) else {
+                let (Some(address), Some(members)) = (item.resolved_address(), live.as_ref()) else {
                     return false;
                 };
                 let Some(biased) = item
@@ -1730,20 +2067,27 @@ impl TemporalEngine {
                 else {
                     return false;
                 };
+                for component in members {
+                    let Ok(member) = hex::decode(component) else {
+                        return false;
+                    };
+                    let component = component.clone();
+                    let address = address.clone();
                 // THE STANDALONE UPSERT IS GONE BECAUSE THE OPERATION DOES IT. Leaving both
                 // filed the record twice, which a replay would then install twice -- the mirror
                 // image of the defect the container exists to stop, and the compiler caught it as
                 // a moved `component` rather than as a double write.
-                super::recorded_map::install_element::<super::recorded_map::ZSetKind>(
-                    shard,
-                    shard_id,
-                    &item.object_key,
-                    Some(component),
-                    member,
-                    (biased, address.clone()),
-                    true,
-                    address,
-                );
+                    super::recorded_map::install_element::<super::recorded_map::ZSetKind>(
+                        shard,
+                        shard_id,
+                        &item.object_key,
+                        Some(component),
+                        member,
+                        (biased, address.clone()),
+                        true,
+                        address,
+                    );
+                }
                 true
             }
             // Every timestamped series is the same shape: stored key -> block, with the key in
@@ -2539,7 +2883,7 @@ impl TemporalEngine {
                 // record until no accepted write can produce an empty one.
                 if !record.outcomes.is_empty() {
                     for item in &record.outcomes {
-                        if !self.apply_outcome_item(shard_id, item) {
+                        if !self.apply_outcome_item(shard_id, item, &record.staged_blocks) {
                             // Say which precondition was unmet. `apply_outcome_item` answers with a
                             // bool from eighteen different places, so the caller was reporting that
                             // an outcome would not install and never which part of it was missing --
@@ -2554,13 +2898,28 @@ impl TemporalEngine {
                                 None => "missing".to_string(),
                                 Some(value) => format!("present, {} chars", value.len()),
                             };
+                            // AND WHETHER THE PAGE NAMES ITS OWN ELEMENTS, which is the term that
+                            // was missing from this message and is now the one the hash arm
+                            // actually fails on. A message naming only the component sent the next
+                            // reader to look at a field the arm no longer asks for -- the shape
+                            // this file documents elsewhere as a gate whose output is not the thing
+                            // it measured.
+                            //
+                            // RESOLVED A SECOND TIME, DELIBERATELY. It costs a page read on a path
+                            // that is about to refuse the whole load, and the alternative is
+                            // threading a diagnostic out of eighteen `false` returns.
+                            let page = self
+                                .elements_the_outcome_page_holds(item, &record.staged_blocks)
+                                .why()
+                                .to_string();
                             return Err(Status::error(
                                 "wal_replay_outcome_refused",
                                 format!(
-                                    "WAL replay could not install a recorded {} outcome at sequence {}; refusing load rather than serving a shard missing it (address {}, component {})",
+                                    "WAL replay could not install a recorded {} outcome at sequence {}; refusing load rather than serving a shard missing it (address {}, page {}, component {})",
                                     item.kind,
                                     record.sequence,
                                     if item.resolved_address().is_some() { "resolved" } else { "UNRESOLVED" },
+                                    page,
                                     component
                                 ),
                             ));
