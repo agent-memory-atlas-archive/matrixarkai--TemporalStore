@@ -983,14 +983,25 @@ impl TemporalEngine {
                     // Recorded with its routing bucket. The synchronous branch below does not go
                     // through `mark_async_dirty_object`, so this is the other of the two sites
                     // that mark an object dirty and the bucket has to be supplied here too.
-                    shard.dirty_objects.insert(
+                    let routing_bucket = block_routing_bucket(
                         &object_key,
-                        block_routing_bucket(
-                            &object_key,
-                            start_routing_bucket,
-                            end_routing_bucket,
-                        ),
+                        start_routing_bucket,
+                        end_routing_bucket,
                     );
+                    // ONE COPY OF THE CHARACTERS, SHARED WITH THE PAGE INDEX. The lookup already
+                    // holds an `Arc<str>` for any object that has blocks; the dirty index used to
+                    // allocate its own equal copy for every object it had not seen since the last
+                    // dump. Read the handle out first so the borrow ends before the mutable one.
+                    let shared = shard
+                        .bucket_index
+                        .object_block_lookup
+                        .any_shared_object_key(&object_key);
+                    match shared {
+                        Some(shared) => {
+                            shard.dirty_objects.insert_shared(shared, routing_bucket)
+                        }
+                        None => shard.dirty_objects.insert(&object_key, routing_bucket),
+                    }
                     // PUSHED, NOT PULLED. The bucket predicate no longer asks a page which object
                     // it belongs to, so the dirtiness has to reach the pages here, where the shard
                     // is in scope. Idempotent, so the async branch below marking again is free.
@@ -5085,11 +5096,23 @@ pub(in crate::engine) fn expiry_index_disagreements(shard: &ShardState) -> usize
 /// Record a deadline for `key`, keeping both expiry indexes in step.
 pub(in crate::engine) fn set_expiry(shard: &mut ShardState, key: String, expires_at: u64) {
     ensure_expiry_order(shard);
-    // ONE ALLOCATION OF THE CHARACTERS, HELD BY BOTH MAPS. `Arc::from(String)` takes the buffer
-    // the caller already owns rather than copying it, and every `Arc::clone` below is a refcount
-    // bump. This used to be three `String`s of the same text per write: one into this map, one
-    // into the mirror, and one more to probe the mirror on an overwrite.
-    let shared: std::sync::Arc<str> = std::sync::Arc::from(key);
+    // ONE ALLOCATION OF THE CHARACTERS, HELD BY BOTH MAPS, AND SHARED WITH THE PAGE INDEX WHERE
+    // IT ALREADY HAS ONE. This used to be three `String`s of the same text per write -- one into
+    // this map, one into the mirror, and one more to probe the mirror on an overwrite -- and then
+    // one `Arc` allocation of characters `object_block_lookup` was frequently already holding.
+    //
+    // CORRECTION TO WHAT THIS COMMENT USED TO SAY: `Arc::from(String)` does NOT take the buffer
+    // the caller already owns. Measured at 4, 24 and 64 characters, it performs one allocation of
+    // `16 + len` and the data pointer moves every time. The COUNT claim -- three `String`s
+    // collapsing to one allocation -- held; the mechanism claim did not.
+    //
+    // Read the handle out before the mutable borrow, and fall back to allocating when the object
+    // has no blocks yet, which is the call that must allocate.
+    let existing = shard
+        .bucket_index
+        .object_block_lookup
+        .any_shared_object_key(&key);
+    let shared: std::sync::Arc<str> = existing.unwrap_or_else(|| std::sync::Arc::from(key));
     if let Some(previous) = shard
         .expires_at_ms
         .insert(std::sync::Arc::clone(&shared), expires_at)
