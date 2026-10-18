@@ -3307,6 +3307,31 @@ fn how_many_times_a_context_keys_characters_exist() {
             },
         });
         assert!(response.status.ok, "event {index}: {:?}", response.status);
+
+        // AND MARK BOTH FLAVOURS OF DIRTY, so `context_dirty_index` is populated rather than
+        // empty. Without this the probe reported it at 0 keys and said nothing about whether its
+        // keys can be shared -- which is the question, since it is one of the last two maps on
+        // this shard still keyed by `String`.
+        for command in [
+            Command::ContextMarkSummaryDirty {
+                tenant_hash: 7,
+                node_hash: 1_000 + index,
+                event_time_ms: 1_787_270_070_000 + index,
+                reason: 1,
+                propagate_depth: 0,
+            },
+            Command::ContextMarkEmbeddingDirty {
+                tenant_hash: 7,
+                node_hash: 1_000 + index,
+                event_time_ms: 1_787_270_070_000 + index,
+                reason: 1,
+                propagate_depth: 0,
+                clear: false,
+            },
+        ] {
+            let marked = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(marked.status.ok, "mark {index}: {:?}", marked.status);
+        }
     }
 
     let shards = engine.shards.read().expect("engine lock poisoned");
@@ -3323,11 +3348,13 @@ fn how_many_times_a_context_keys_characters_exist() {
         ("context_children", shard.context_children.keys().map(|k| &**k).collect()),
         ("context_summaries", shard.context_summaries.keys().map(|k| &**k).collect()),
         ("context_compressions", shard.context_compressions.keys().map(|k| &**k).collect()),
-        ("context_compression_watermark", shard.context_compression_watermark.keys().map(|k| k.as_str()).collect()),
+        ("context_compression_watermark (Arc-keyed)", shard.context_compression_watermark.keys().map(|k| &**k).collect()),
         ("context_nodes (Arc-keyed)", shard.context_nodes.keys().map(|k| &**k).collect()),
     ];
 
     let mut copies: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut holders_of: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
     let mut characters = 0usize;
     println!();
     println!("  {EVENTS} context events written");
@@ -3340,9 +3367,17 @@ fn how_many_times_a_context_keys_characters_exist() {
         println!("  {name:34} {:>5}   {chars:>9}", keys.len());
         for k in keys {
             *copies.entry(k).or_insert(0) += 1;
+            holders_of.entry(k).or_insert_with(Vec::new).push(*name);
         }
     }
     let distinct = copies.len();
+    // KEYS THAT EXIST IN EXACTLY ONE MAP CANNOT BE SHARED WITH ANYTHING, and that is the end of
+    // the one-copy road rather than a gap in it. A key is shareable only if some OTHER structure
+    // holds the same characters; the dirty keys carry their own prefixes (`ctx:dirty:`,
+    // `ctx:embdirty:`), no other map is keyed by them, and they are never written to the block
+    // store so the page index does not hold them either. One holder, one allocation, nothing to
+    // adopt.
+    let single_holder = copies.values().filter(|n| **n == 1).count();
     let total_entries: usize = holders.iter().map(|(_, k)| k.len()).sum();
     let mut by_count: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for n in copies.values() {
@@ -3350,6 +3385,7 @@ fn how_many_times_a_context_keys_characters_exist() {
     }
     println!();
     println!("  distinct key texts: {distinct}; total map entries: {total_entries}");
+    println!("  key texts held by exactly ONE map: {single_holder} -- nothing to share with");
     for (n, how_many) in &by_count {
         println!("    {how_many} key texts exist in {n} map(s)");
     }
@@ -3447,6 +3483,31 @@ fn how_many_times_a_context_keys_characters_exist() {
          site from one handle. A shortfall means some caller went back to minting its own key, which \
          puts a second copy of every event key's characters back -- and it will NOT show up in the \
          per-key total, because a clone-based probe cannot see an `Arc` payload."
+    );
+
+    // THE GUARD THAT KEEPS ONE-COPY TRUE AS MAPS ARE ADDED.
+    //
+    // A key is shareable only when some OTHER structure holds the same characters, so the rule is
+    // NOT "every map should be `Arc`-keyed". The 800 dirty keys above live in exactly one map and
+    // have nothing to share with, which is why `context_dirty_index` keeping its `String` key
+    // costs nothing at all. The rule is: if a key text is held by MORE THAN ONE map, every holder
+    // must be able to share, or those characters exist twice -- and no clone-based byte probe will
+    // say so, because cloning an `Arc` is a refcount bump.
+    //
+    // So this fails when a `String`-keyed map starts holding a key another map already holds,
+    // which is exactly how a duplicate gets reintroduced after the adoption work.
+    let mut unshareable_duplicates: Vec<(&str, Vec<&str>)> = holders_of
+        .iter()
+        .filter(|(_, holders)| holders.len() > 1)
+        .filter(|(_, holders)| holders.iter().any(|name| !name.contains("Arc-keyed")))
+        .map(|(key, holders)| (*key, holders.clone()))
+        .collect();
+    unshareable_duplicates.sort();
+    assert!(
+        unshareable_duplicates.is_empty(),
+        "{} key texts are held by several maps where at least one CANNOT share, so those          characters exist more than once: {:?}. Either the new holder takes a `ModelKey` and joins          `adopt_object_key_allocations`, or it should not be keyed by the object key at all.",
+        unshareable_duplicates.len(),
+        &unshareable_duplicates[..unshareable_duplicates.len().min(4)]
     );
 
     assert!(
@@ -4049,4 +4110,360 @@ fn what_the_default_configuration_does_to_a_forty_thousand_key_shard() {
         "the default declined for a reason other than being below the bound"
     );
     assert_eq!(before, after, "the default declined and yet the index moved");
+}
+
+/// WHY THERE ARE TWENTY-SIX PER-KEY MAPS AND NOT ONE, measured on one key written four ways.
+///
+/// The consolidation question is not "could these maps be merged" but "would merging them save
+/// anything", and that turns entirely on whether one KEY TEXT is held by several of them. A record
+/// folded into the consolidated map pays `ObjectSlot` at 32 bytes where a bare address map pays
+/// `ElementEntry` at 16 -- so consolidating a key that lives in exactly ONE map makes it BIGGER by
+/// 16 bytes, and only a key living in several maps gets smaller by losing the other entries.
+///
+/// So this writes the SAME raw key through four families and counts the holders of every key text
+/// the shard ends up with. The answer is a property of how the keys are DERIVED, not of the
+/// containers: each family prefixes the raw key with its own name, so the texts are disjoint.
+///
+/// A MAP SHOWING ZERO KEYS HERE IS NOT A MAP WITH NO WRITER, and reading it that way was an error
+/// made against this very output. `control_state_uuid`, `control_state_rollups` and
+/// `feature_rollups` report zero on this fixture and ALL THREE have production writers: the first
+/// through a multi-line chain (`shard` / `.control_state_uuid` / `.insert(..)`) that a single-line
+/// grep cannot match, the other two through `windowed_sum_series(&mut shard.., ..)`, which inserts
+/// into whatever map it is handed. `control_state_uuid` is also `#[serde(default)]`, so a stored
+/// image fills it with no code path involved at all.
+///
+/// So this probe answers "is this key duplicated", never "is this map dead". The second question
+/// needs the three checks a grep misses: multi-line chains, `&mut` escapes into helpers, and
+/// deserialization.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib why_there_are_many_per_key_maps -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "writes one key through four families; run by name"]
+fn why_there_are_many_per_key_maps_and_not_one() {
+    const KEYS: usize = 64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+
+    for index in 0..KEYS {
+        let raw = format!("k{index:04}");
+        let commands = vec![
+            Command::StringSet { key: raw.clone(), value: vec![b'v'; 32] },
+            Command::FeatureAppend {
+                key: raw.clone(),
+                points: vec![crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index as u64,
+                    value: vec![b'f'; 8],
+                }],
+            },
+            Command::ControlStateSetAndGet {
+                family: crate::types::ControlStateFamily::Counter,
+                key: raw.clone(),
+                timestamp_ms: 1_787_270_070_000 + index as u64,
+                amount: 1,
+                start_ms: 0,
+                end_ms: u64::MAX,
+                aggregator: "sum".to_string(),
+            },
+            Command::ControlStateSelectionSet {
+                key: raw.clone(),
+                value: vec![b's'; 8],
+                occur_time_ms: 1_787_270_070_000 + index as u64,
+                ttl_ms: 0,
+                selection_type: crate::types::ControlStateSelectionType::Last,
+            },
+            // THE REMAINING MAPS WITH WRITERS, so this covers every per-key map a non-context
+            // write can reach rather than the four the first version happened to drive. The last
+            // one is a QUERY on purpose: `FeatureAggQuery` caches its decoded answer in
+            // `feature_values` under the same key `features` is keyed by, so a read is what puts
+            // a second holder on the key.
+            Command::SeenCheck {
+                key: raw.clone(),
+                member: vec![b'm'; 8],
+                window_ms: 60_000,
+            },
+            Command::BucketTake {
+                key: raw.clone(),
+                tokens: 1.0,
+                capacity: 10.0,
+                refill_per_sec: 1.0,
+            },
+            Command::FeatureAggQuery {
+                key: raw.clone(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                aggregator: "sum".to_string(),
+                count: None,
+            },
+        ];
+        for command in commands {
+            let response = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    // Every per-key map a non-context write can land in, with the key TEXTS it holds.
+    // EACH KEY CARRIES ITS DATA POINTER, which is what makes this check representation-agnostic.
+    // A `String` key and an `Arc<str>` key both expose the address of their characters, so "do
+    // these two maps hold ONE allocation or two equal ones" is answerable without knowing, or
+    // maintaining a list of, which maps are keyed by what. An allowlist of map names goes stale
+    // the moment a map is converted; a pointer does not.
+    let holders: Vec<(&str, Vec<(&str, usize)>)> = vec![
+        ("strings", shard.strings.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        ("features", shard.features.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        (
+            "control_state",
+            shard.control_state.keys().map(|k| (k.as_str(), k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "control_state_selection",
+            shard
+                .control_state_selection
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "control_state_uuid",
+            shard.control_state_uuid.keys().map(|k| (k.as_str(), k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "control_state_rollups",
+            shard.control_state_rollups.keys().map(|k| (k.as_str(), k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "feature_values",
+            shard.feature_values.keys().map(|k| (k.as_str(), k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "feature_rollups",
+            shard.feature_rollups.keys().map(|k| (k.as_str(), k.as_ptr() as usize)).collect(),
+        ),
+        ("seen", shard.seen.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        ("buckets", shard.buckets.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        (
+            "expires_at_ms",
+            shard.expires_at_ms.keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+    ];
+
+    let mut holders_of: std::collections::BTreeMap<&str, Vec<(&str, usize)>> =
+        std::collections::BTreeMap::new();
+    println!();
+    println!("  {KEYS} raw keys, each written through seven commands across every writable per-key map");
+    println!("  map                            keys");
+    for (name, keys) in &holders {
+        println!("  {name:30} {:>5}", keys.len());
+        for (text, ptr) in keys {
+            holders_of.entry(text).or_default().push((*name, *ptr));
+        }
+    }
+
+    let mut by_holders: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    for maps in holders_of.values() {
+        *by_holders.entry(maps.len()).or_insert(0) += 1;
+    }
+    println!();
+    println!("  distinct key texts: {}", holders_of.len());
+    for (n, how_many) in &by_holders {
+        println!("    {how_many} texts are held by {n} map(s)");
+    }
+    let shareable: usize = holders_of.values().filter(|m| m.len() > 1).count();
+    println!("  texts held by MORE THAN ONE map -- the only consolidation candidates: {shareable}");
+    println!();
+    println!("  a sample of the texts one raw key turns into:");
+    for (text, maps) in holders_of.iter().filter(|(t, _)| t.contains("k0000")) {
+        println!("    {text:38} <- {maps:?}");
+    }
+    println!();
+    println!(
+        "  widths: ElementEntry {} B, ObjectRecord {} B, ObjectSlot {} B -- so folding a key that",
+        std::mem::size_of::<ElementEntry>(),
+        std::mem::size_of::<crate::engine::object_record::ObjectRecord>(),
+        std::mem::size_of::<crate::engine::object_record::ObjectSlot>()
+    );
+    println!("  lives in ONE map into the consolidated map makes it larger, not smaller.");
+
+    // THE GUARD: one key text, one allocation, whatever holds it.
+    //
+    // Measured by POINTER, so it cannot be satisfied by two maps holding equal copies. Any text
+    // whose holders report more than one distinct address has its characters stored once per
+    // address, and a clone-based byte probe will never say so, because cloning an `Arc` is a
+    // refcount bump.
+    let mut duplicated: Vec<(&str, Vec<(&str, usize)>)> = holders_of
+        .iter()
+        .filter(|(_, held)| {
+            held.iter().map(|(_, ptr)| *ptr).collect::<std::collections::HashSet<_>>().len() > 1
+        })
+        .map(|(text, held)| (*text, held.clone()))
+        .collect();
+    duplicated.sort();
+    println!();
+    println!(
+        "  by ALLOCATION: {} of {} texts are stored more than once",
+        duplicated.len(),
+        holders_of.len()
+    );
+    assert!(
+        duplicated.is_empty(),
+        "{} key texts are stored more than once -- the holders report different addresses for the          same characters: {:?}. A map holding a key another map already holds must take a          `ModelKey` and join `adopt_object_key_allocations`.",
+        duplicated.len(),
+        &duplicated[..duplicated.len().min(3)]
+    );
+
+    assert!(!holders_of.is_empty(), "no keys landed -- the write path populated nothing");
+    assert!(
+        std::mem::size_of::<crate::engine::object_record::ObjectSlot>()
+            > std::mem::size_of::<ElementEntry>(),
+        "the consolidated slot is no longer wider than a bare address, so the arithmetic above \
+         changed and the conclusion has to be re-derived"
+    );
+}
+
+/// WHAT CONSOLIDATING THE THREE HOLDERS OF A RAW KEY WOULD COST, AND AT WHAT OVERLAP IT PAYS.
+///
+/// `why_there_are_many_per_key_maps_and_not_one` shows a raw key landing in `strings`, `features`
+/// and `control_state_selection`. The obvious next move is one entry per key instead of three, and
+/// the obvious place is the consolidated map -- except that `ObjectRecord` is 24 bytes carrying a
+/// deadline word and a page-address word, and nothing else. It cannot hold an 8-byte series or a
+/// 40-byte selection value: those maps are DOMAIN-valued, not address-valued, so they cannot fold
+/// into `ObjectSlot` without widening it.
+///
+/// So the question is what a PURPOSE-BUILT consolidated entry would cost, and the answer has two
+/// arms rather than one number:
+///
+///   * a key held by all three maps pays one key field instead of three, and one table instead of
+///     three -- the win;
+///   * a key held by ONE map pays the slots of the two values it does not have -- the loss.
+///
+/// Which dominates is a property of the WORKLOAD, not of the design, so this measures both arms and
+/// prints the overlap fraction where they cross. A design chosen without that fraction is chosen on
+/// the arm whoever argued for it happened to measure.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_consolidating_three_holders_would_cost -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds four map shapes at 20,000 keys; run by name"]
+fn what_consolidating_three_holders_would_cost() {
+    use crate::engine::timestamped_series::OwnedTimestampedSeries;
+    const KEYS: usize = 20_000;
+
+    // The union a consolidated entry would have to hold: every value, each optional, because a key
+    // present in one map has nothing for the other two.
+    // `Clone` because `deep_heap_bytes` measures by cloning -- the probe cannot weigh a shape
+    // it cannot copy.
+    #[allow(dead_code)]
+    #[derive(Clone)]
+    struct Consolidated {
+        address: Option<ElementEntry>,
+        series: Option<OwnedTimestampedSeries>,
+        selection: Option<(u64, Vec<u8>, u8)>,
+    }
+
+    let key = |i: usize| -> std::sync::Arc<str> { std::sync::Arc::from(format!("k{i:08}").as_str()) };
+    let address = |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 64, Some(0), Some(i as u64));
+    let series = |i: usize| {
+        let mut s = OwnedTimestampedSeries::default();
+        s.insert(i as u64, address(i));
+        s
+    };
+    let selection = || (7u64, vec![b's'; 8], 1u8);
+
+    // ARM A: three maps, one entry each, every key in all three. Keys SHARED, because that is the
+    // state on this branch -- the adoption puts all three holders on one allocation, so the only
+    // thing three maps still cost over one is the key FIELD and the table, not the characters.
+    let shared: Vec<std::sync::Arc<str>> = (0..KEYS).map(key).collect();
+    let mut m_strings: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::new();
+    let mut m_series: HashMap<std::sync::Arc<str>, OwnedTimestampedSeries> = HashMap::new();
+    let mut m_selection: HashMap<std::sync::Arc<str>, (u64, Vec<u8>, u8)> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        m_strings.insert(std::sync::Arc::clone(k), address(i));
+        m_series.insert(std::sync::Arc::clone(k), series(i));
+        m_selection.insert(std::sync::Arc::clone(k), selection());
+    }
+    let three_maps =
+        deep_heap_bytes(&m_strings) + deep_heap_bytes(&m_series) + deep_heap_bytes(&m_selection);
+
+    // ARM B: one map, one entry per key, all three values present.
+    let mut m_one: HashMap<std::sync::Arc<str>, Consolidated> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        m_one.insert(
+            std::sync::Arc::clone(k),
+            Consolidated {
+                address: Some(address(i)),
+                series: Some(series(i)),
+                selection: Some(selection()),
+            },
+        );
+    }
+    let one_map_full = deep_heap_bytes(&m_one);
+
+    // ARM C: the LOSING arm -- every key in one map only, three maps.
+    let mut c_strings: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        c_strings.insert(std::sync::Arc::clone(k), address(i));
+    }
+    let three_maps_no_overlap = deep_heap_bytes(&c_strings);
+
+    // ARM D: the same keys in the consolidated shape, two slots empty.
+    let mut d_one: HashMap<std::sync::Arc<str>, Consolidated> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        d_one.insert(
+            std::sync::Arc::clone(k),
+            Consolidated { address: Some(address(i)), series: None, selection: None },
+        );
+    }
+    let one_map_sparse = deep_heap_bytes(&d_one);
+
+    println!();
+    println!("  {KEYS} keys, key allocations SHARED in every arm (so this prices fields and tables)");
+    println!(
+        "    widths: ElementEntry {} B, OwnedTimestampedSeries {} B, selection {} B, Consolidated {} B",
+        std::mem::size_of::<ElementEntry>(),
+        std::mem::size_of::<OwnedTimestampedSeries>(),
+        std::mem::size_of::<(u64, Vec<u8>, u8)>(),
+        std::mem::size_of::<Consolidated>()
+    );
+    println!();
+    println!("  FULL OVERLAP -- every key in all three:");
+    println!("    three maps      {three_maps:>10} B   {:>7.1} B/key", three_maps as f64 / KEYS as f64);
+    println!("    one map         {one_map_full:>10} B   {:>7.1} B/key", one_map_full as f64 / KEYS as f64);
+    let win = three_maps as f64 - one_map_full as f64;
+    println!("    consolidation {:>+12.1} B   {:>+7.1} B/key", win, win / KEYS as f64);
+    println!();
+    println!("  NO OVERLAP -- every key in one map only:");
+    println!(
+        "    one bare map    {three_maps_no_overlap:>10} B   {:>7.1} B/key",
+        three_maps_no_overlap as f64 / KEYS as f64
+    );
+    println!(
+        "    one map, sparse {one_map_sparse:>10} B   {:>7.1} B/key",
+        one_map_sparse as f64 / KEYS as f64
+    );
+    let loss = three_maps_no_overlap as f64 - one_map_sparse as f64;
+    println!("    consolidation {:>+12.1} B   {:>+7.1} B/key", loss, loss / KEYS as f64);
+    println!();
+    let per_key_win = win / KEYS as f64;
+    let per_key_loss = -loss / KEYS as f64;
+    if per_key_win > 0.0 && per_key_loss > 0.0 {
+        let breakeven = per_key_loss / (per_key_win + per_key_loss);
+        println!(
+            "  BREAK-EVEN: consolidation pays once more than {:.1}% of keys are held by all three.",
+            100.0 * breakeven
+        );
+        println!("  Below that fraction it costs more than the three maps it replaces.");
+    } else {
+        println!("  One arm does not trade -- read the two figures above rather than a fraction.");
+    }
+
+    assert!(three_maps > 0 && one_map_full > 0, "a zero figure cannot be compared");
 }

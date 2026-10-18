@@ -3827,12 +3827,12 @@ fn capture_key_states(shard: &ShardState, keys: &[String]) -> Vec<serde_json::Va
             "features",
             shard
                 .features
-                .get(key)
+                .get(&key[..])
                 .and_then(|v| serde_json::to_value(v.to_btree()).ok()),
         );
             put("expires_at_ms", shard.expires_at_ms.get(key.as_str()).and_then(|v| serde_json::to_value(v).ok()));
             put("control_state_changes", shard.control_state_changes.get(key).and_then(|v| serde_json::to_value(v).ok()));
-            put("control_state_selection", shard.control_state_selection.get(key).and_then(|v| serde_json::to_value(v).ok()));
+            put("control_state_selection", shard.control_state_selection.get(&key[..]).and_then(|v| serde_json::to_value(v).ok()));
             put(
             "context_nodes",
             shard
@@ -5062,7 +5062,7 @@ fn maybe_auto_compress_context_node(
     }
     shard
         .context_compression_watermark
-        .insert(event_object_key.to_string(), window.end_ms);
+        .insert(std::sync::Arc::from(&event_object_key[..]), window.end_ms);
     invalidate_context_record(cache, shard_id, &compression_key);
     mutated
 }

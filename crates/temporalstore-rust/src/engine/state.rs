@@ -271,7 +271,7 @@ pub(super) struct ShardState {
     /// crash forgetting a window's worth of members re-admits a duplicate rather than
     /// dropping a legitimate first ingest.
     #[serde(default, with = "super::seen_index_serde")]
-    pub(super) seen: HashMap<String, SeenSet>,
+    pub(super) seen: HashMap<ModelKey, SeenSet>,
     /// Token buckets: key -> (tokens remaining, last refill ms). Config rides each command,
     /// never the store -- the caller owns policy, which is exactly what a quota layer wants.
     /// No blocks back this state: it persists only with the shard index snapshot, so a crash
@@ -279,7 +279,7 @@ pub(super) struct ShardState {
     /// limiter that briefly over-admits after a crash beats one that starves recovered
     /// tenants on stale counts.
     #[serde(default)]
-    pub(super) buckets: HashMap<String, (f64, u64)>,
+    pub(super) buckets: HashMap<ModelKey, (f64, u64)>,
     /// Sorted sets: member -> (total-order score bits, element block). The score-ordered view
     /// is derived per query -- V1 accepts the per-range sort; the upgrade path is a second
     /// in-memory map rebuilt at load, never a second persisted structure (the index component
@@ -309,7 +309,7 @@ pub(super) struct ShardState {
     ///
     /// The stored image does not move: see [`super::timestamped_series::as_btree_maps`].
     #[serde(with = "super::timestamped_series::as_btree_maps")]
-    pub(super) features: HashMap<String, OwnedTimestampedSeries>,
+    pub(super) features: HashMap<ModelKey, OwnedTimestampedSeries>,
     pub(super) control_state: HashMap<String, BTreeMap<u64, i64>>,
     /// Counter-series blocks, one per control-state object key.
     ///
@@ -411,7 +411,7 @@ pub(super) struct ShardState {
     pub(super) control_state_changes:
         HashMap<String, BTreeMap<u64, super::hll::DistinctBucket>>,
     #[serde(default, alias = "control_state_fol")]
-    pub(super) control_state_selection: HashMap<String, ControlStateSelectionValue>,
+    pub(super) control_state_selection: HashMap<ModelKey, ControlStateSelectionValue>,
     // UUID idempotency ledger for control-state writes: uuid -> expiry_ms. Mirrors
     // the control_state 300s dedup window so at-least-once queue replays do not
     // double-count. Lazily garbage-collected on write; in-memory + serde-default so
@@ -546,7 +546,7 @@ pub(super) struct ShardState {
     // ephemeral (serde-skipped); on loss the auto-compression trigger re-compresses
     // the oldest pending window idempotently (stable compression id per window).
     #[serde(skip)]
-    pub(super) context_compression_watermark: HashMap<String, u64>,
+    pub(super) context_compression_watermark: HashMap<ModelKey, u64>,
     // Entities are grouped by their OWNING NODE, not one map key per entity: the key is
     // `ctx:entity:{tenant}:{node}` (context_entity_collection_key) and the BTreeMap holds every
     // entity of that node. The inner u64 is the ENTITY HASH, not a timestamp -- unlike
@@ -7636,6 +7636,26 @@ impl ShardState {
         // missing from this list, which is the failure the note above describes: a map that
         // CAN share and is not listed here keeps its own equal copy and nothing fails.
         moved |= adopt_key_in(&mut self.context_nodes, object_key, &canonical);
+        // Keyed by the EVENT object key, so it is another holder of a key the event pair
+        // already holds. Found only by grepping from the crate root: the write is a
+        // multi-line `insert` in `engine.rs`, which a search rooted at `engine/` misses.
+        moved |= adopt_key_in(&mut self.context_compression_watermark, object_key, &canonical);
+        // NOT CONTEXT MAPS, AND THEY BELONG HERE ANYWAY. A raw key written as a string, a
+        // feature series and a selection lands in all three of those maps -- measured, 64 of 64
+        // keys in `why_there_are_many_per_key_maps_and_not_one` -- and only `strings` could
+        // share, so the other two each owned a second and third copy of the same characters.
+        // `strings` TOO, and leaving it out is what the pointer guard caught. It takes its
+        // handle at its own write site, which runs BEFORE the page index holds one -- so it
+        // minted, while the maps adopted here later converged on the page index's
+        // allocation. Three holders, two allocations, and no byte probe would have said so.
+        moved |= adopt_key_in(&mut self.strings, object_key, &canonical);
+        // `seen` and `buckets` too: a raw key used for a string, a series, a selection, a
+        // seen-set and a rate bucket lands in FIVE maps, and the pointer guard measured
+        // THREE allocations before these two joined -- each was holding its own copy.
+        moved |= adopt_key_in(&mut self.seen, object_key, &canonical);
+        moved |= adopt_key_in(&mut self.buckets, object_key, &canonical);
+        moved |= adopt_key_in(&mut self.features, object_key, &canonical);
+        moved |= adopt_key_in(&mut self.control_state_selection, object_key, &canonical);
         if moved {
             CONTEXT_EVENT_ADOPT_MOVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

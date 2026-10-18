@@ -1637,7 +1637,7 @@ pub(crate) fn execute_on_shard(
                 Some(now),
                 false,
             );
-            let seen = shard.seen.entry(key).or_default();
+            let seen = shard.seen.entry(std::sync::Arc::from(&key[..])).or_default();
             // Bounded sweep from the time-ordered front: enough to keep pace with any
             // sustained rate, never enough to stall a hot call on a huge backlog.
             for _ in 0..128 {
@@ -1680,7 +1680,7 @@ pub(crate) fn execute_on_shard(
                 };
             }
             CommandResponse::Integer {
-                value: shard.seen.get(&key).map_or(0, |seen| seen.by_member.len()) as i64,
+                value: shard.seen.get(&key[..]).map_or(0, |seen| seen.by_member.len()) as i64,
             }
         }
         Command::BucketTake {
@@ -1697,7 +1697,7 @@ pub(crate) fn execute_on_shard(
             // caller whose limit was meant to have been discarded.
             remove_if_expired(shard, &key);
             let now = resolve_now_ms();
-            let current = shard.buckets.get(&key).copied();
+            let current = shard.buckets.get(&key[..]).copied();
             let (allowed, remaining, retry_after_ms, next) =
                 bucket_take(current, now, tokens, capacity, refill_per_sec);
             // The outcome is the bucket the take LEFT BEHIND -- tokens and the refill moment --
@@ -1748,7 +1748,7 @@ pub(crate) fn execute_on_shard(
                 None,
                 false,
             );
-            shard.buckets.insert(key, next);
+            shard.buckets.insert(std::sync::Arc::from(&key[..]), next);
             mutated = true;
             CommandResponse::Members {
                 members: bucket_answer(allowed, remaining, retry_after_ms),
@@ -1767,7 +1767,7 @@ pub(crate) fn execute_on_shard(
                 mutated = true;
             }
             let now = resolve_now_ms();
-            let current = shard.buckets.get(&key).copied();
+            let current = shard.buckets.get(&key[..]).copied();
             let (allowed, remaining, retry_after_ms, _) =
                 bucket_take(current, now, tokens, capacity, refill_per_sec);
             CommandResponse::Members {
@@ -2249,7 +2249,7 @@ pub(crate) fn execute_on_shard(
         }
         Command::FeatureAppend { key, points } => {
             remove_if_expired(shard, &key);
-            let series = shard.features.entry(key.clone()).or_default();
+            let series = shard.features.entry(std::sync::Arc::from(&key[..])).or_default();
             let routing_bucket =
                 block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
             let points = sorted_feature_points(points);
@@ -2323,7 +2323,7 @@ pub(crate) fn execute_on_shard(
             policy,
         } => {
             remove_if_expired(shard, &key);
-            let series = shard.features.entry(key.clone()).or_default();
+            let series = shard.features.entry(std::sync::Arc::from(&key[..])).or_default();
             let routing_bucket =
                 block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
             let mut accepted_points = Vec::new();
@@ -2412,7 +2412,7 @@ pub(crate) fn execute_on_shard(
                 || {
                     let points = shard
                         .features
-                        .get(&key)
+                        .get(&key[..])
                         .map(|series| {
                             let mut page_cache = HashMap::new();
                             // feature_append_keeps_oversized_single_timestamped_value_readable:
@@ -2468,7 +2468,7 @@ pub(crate) fn execute_on_shard(
             let limit = count.unwrap_or(feature_max_size).min(feature_max_size);
             let points = shard
                 .features
-                .get(&key)
+                .get(&key[..])
                 .map(|series| {
                     let mut page_cache = HashMap::new();
                     series
@@ -2512,7 +2512,7 @@ pub(crate) fn execute_on_shard(
             points,
         } => {
             remove_if_expired(shard, &key);
-            let series = shard.features.entry(key.clone()).or_default();
+            let series = shard.features.entry(std::sync::Arc::from(&key[..])).or_default();
             let routing_bucket =
                 block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
             let replaced = series
@@ -2578,7 +2578,7 @@ pub(crate) fn execute_on_shard(
                 None,
                 true,
             );
-            mutated |= shard.features.remove(&key).is_some();
+            mutated |= shard.features.remove(&key[..]).is_some();
             mutated |= mark_bucket_index_object_deleted(shard, &key);
             let _ = cache.invalidate_record(shard_id, "feature", &key);
             CommandResponse::Empty
@@ -2612,7 +2612,7 @@ pub(crate) fn execute_on_shard(
                 // are bit-identical to the raw scan; rebuild when the series length changed.
                 let feature_len = shard
                     .features
-                    .get(&key)
+                    .get(&key[..])
                     .map(|series| series.len())
                     .unwrap_or(0);
                 let stale = shard
@@ -2623,7 +2623,7 @@ pub(crate) fn execute_on_shard(
                 if stale {
                     let decoded: BTreeMap<u64, i64> = shard
                         .features
-                        .get(&key)
+                        .get(&key[..])
                         .map(|series| {
                             series
                                 .iter()
@@ -2660,7 +2660,7 @@ pub(crate) fn execute_on_shard(
             } else {
                 let values = shard
                     .features
-                    .get(&key)
+                    .get(&key[..])
                     .map(|series| {
                         series
                             .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
@@ -2691,7 +2691,7 @@ pub(crate) fn execute_on_shard(
         }
         Command::SequenceAdd { key, rows } => {
             remove_if_expired(shard, &key);
-            let series = shard.features.entry(key.clone()).or_default();
+            let series = shard.features.entry(std::sync::Arc::from(&key[..])).or_default();
             let routing_bucket =
                 block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
             let points = rows
@@ -2756,7 +2756,7 @@ pub(crate) fn execute_on_shard(
             }
             let rows = shard
                 .features
-                .get(&key)
+                .get(&key[..])
                 .map(|series| {
                     series
                         .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
@@ -3264,7 +3264,7 @@ pub(crate) fn execute_on_shard(
             };
             let should_store = shard
                 .control_state_selection
-                .get(&key)
+                .get(&key[..])
                 .map(|existing| match selection_type {
                     ControlStateSelectionType::First => occur_time_ms < existing.occur_time_ms,
                     ControlStateSelectionType::Last => occur_time_ms > existing.occur_time_ms,
@@ -3286,7 +3286,7 @@ pub(crate) fn execute_on_shard(
                     Some(value.clone()),
                 );
                 shard.control_state_selection.insert(
-                    key.clone(),
+                    std::sync::Arc::from(&key[..]),
                     ControlStateSelectionValue {
                         occur_time_ms,
                         value,
@@ -3325,7 +3325,7 @@ pub(crate) fn execute_on_shard(
             CommandResponse::Bytes {
                 value: shard
                     .control_state_selection
-                    .get(&key)
+                    .get(&key[..])
                     .map(|stored| stored.value.clone()),
             }
         }
@@ -3432,7 +3432,7 @@ pub(crate) fn execute_on_shard(
                         .into_bytes(),
                 ));
             }
-            if let Some(fol) = shard.control_state_selection.get(&key) {
+            if let Some(fol) = shard.control_state_selection.get(&key[..]) {
                 entries.push(("fol_value".to_string(), fol.value.clone()));
                 entries.push((
                     "fol_occur_time_ms".to_string(),

@@ -1951,7 +1951,7 @@ impl TemporalEngine {
                 let (Some(member), Some(seen_at)) = (item.value.clone(), item.ttl) else {
                     return false;
                 };
-                let seen = shard.seen.entry(item.object_key.clone()).or_default();
+                let seen = shard.seen.entry(std::sync::Arc::from(&item.object_key[..])).or_default();
                 if let Some(previous) = seen.by_member.insert(member.clone(), seen_at) {
                     seen.by_time.remove(&(previous, member.clone()));
                 }
@@ -1970,7 +1970,7 @@ impl TemporalEngine {
                 let refilled_at = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
                 shard
                     .buckets
-                    .insert(item.object_key.clone(), (tokens, refilled_at));
+                    .insert(std::sync::Arc::from(&item.object_key[..]), (tokens, refilled_at));
                 true
             }
             "string" => {
@@ -2391,7 +2391,7 @@ impl TemporalEngine {
                     _ => return false,
                 };
                 shard.control_state_selection.insert(
-                    item.object_key.clone(),
+                    std::sync::Arc::from(&item.object_key[..]),
                     super::state::ControlStateSelectionValue {
                         occur_time_ms: item.ttl.unwrap_or_default(),
                         value,
