@@ -7866,6 +7866,19 @@ cached_last_sequence {wal_cached_bytes} B  -> the two disk reads cost {} B",
 /// utilisation already uses. That means a fixture which wrote nothing would satisfy every assertion
 /// here by reporting 0 against 0. The denominators are therefore asserted non-zero BEFORE the
 /// identities, and the branch taken is printed, so "it passed" cannot mean "it measured nothing".
+///
+/// # AND A GREEN RUN HERE DOES NOT MEAN THE NAMES ARE RIGHT
+///
+/// Every identity below is the name's own arithmetic AS THIS TREE COMPUTES IT. That is worth
+/// pinning -- it catches a numerator or denominator swapped under a stable name -- but it is
+/// self-consistency, not agreement with the definition the metric name comes from. This arm passed
+/// for the whole time `logical_write_amplification_ppm` published physical-over-logical, because it
+/// asserted exactly that. A guard can be green and the name still wrong.
+///
+/// What the names are checked AGAINST, rather than for self-consistency, is
+/// `the_amplification_set_in_the_published_format`, which computes each ratio from the external
+/// definition and compares. The two arms are not redundant: this one fails if the arithmetic
+/// drifts, that one fails if the arithmetic is right and the name is not.
 #[test]
 fn the_published_amplification_ratios_are_the_ratio_they_name() {
     use crate::types::{Command, ExecuteRequest};
@@ -7955,6 +7968,78 @@ fn the_published_amplification_ratios_are_the_ratio_they_name() {
         println!("  space amplification not exercised: nothing is live on a slab yet");
     }
 
+    // --- THE CORRECTLY NAMED FIELD CARRIES THE SAME VALUE, which is the whole claim of keeping
+    // --- both spellings. If these two ever diverge, one of them was re-pointed and a consumer
+    // --- reading either one is getting a different quantity than it was.
+    assert_eq!(
+        after.storage.storage_write_amplification_ppm, expected_write,
+        "`storage_write_amplification_ppm` is the correct name for physical-over-logical and must \
+         equal {expected_write} ppm, and {} was published",
+        after.storage.storage_write_amplification_ppm,
+    );
+    assert_eq!(
+        after.storage.logical_write_amplification_ppm,
+        after.storage.storage_write_amplification_ppm,
+        "the two spellings of the storage-write ratio diverged -- {} under the old name, {} under \
+         the correct one. They are kept equal on purpose: the old name is a wire key that travels \
+         to the meta server, so its VALUE is frozen and the new name exists to describe it.",
+        after.storage.logical_write_amplification_ppm,
+        after.storage.storage_write_amplification_ppm,
+    );
+
+    // --- THE UNIT-MATCHED WRITE RATIO. Both halves are stored bytes, so this is 1.0x on a corpus
+    // --- written once however well it compressed -- which is the property that distinguishes it
+    // --- from the ratio above, and it is asserted rather than printed because the corpus here IS
+    // --- written once.
+    // THE DENOMINATOR HERE IS THE INDEX'S OWN TALLY, NOT THE SLAB SUMMARY'S. On this write-once
+    // corpus the two are equal, so an identity written against `live_physical_bytes` would pass
+    // whichever one the field used -- and that is exactly the substitution that must not go
+    // unnoticed, because the slab-granular denominator cannot fall under rewrite.
+    // `the_live_denominator_must_fall_when_a_key_is_overwritten` separates the two; this pins the
+    // arithmetic against the right one so that arm is not the only thing holding it.
+    let index_live_bytes = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let live = &shard.bucket_index.block_slab_live;
+        assert!(
+            live.is_ready(),
+            "the per-slab live tally is not ready, so the published denominator is 0 by \
+             construction and the identity below would be vacuous"
+        );
+        live.iter().map(|(_, tally)| tally.bytes).sum::<u64>()
+    };
+    if index_live_bytes > 0 {
+        let expected_live = store.bytes_written.saturating_mul(1_000_000) / index_live_bytes;
+        assert_eq!(
+            after.storage.lifetime_write_amplification_ppm, expected_live,
+            "the published lifetime write amplification is not written over the INDEX's live \
+             bytes: {} physical written over {index_live_bytes} live should be {expected_live} \
+             ppm, and {} was published",
+            store.bytes_written,
+            after.storage.lifetime_write_amplification_ppm,
+        );
+        println!(
+            "  lifetime write amplification {:.4}x  ({} physical written / {index_live_bytes} \
+             index-live bytes; the slab summary says {} live)",
+            expected_live as f64 / 1_000_000.0,
+            store.bytes_written,
+            slabs.live_physical_bytes,
+        );
+        // EVERY KEY WRITTEN EXACTLY ONCE AND NOTHING DELETED, so the store is holding precisely
+        // what it wrote and the ratio must be 1.0x. This is the assertion that would have caught
+        // the mixed-unit version: that one reads 7.3x here, on a workload with no rewrite at all.
+        assert_eq!(
+            1_000_000, after.storage.lifetime_write_amplification_ppm,
+            "200 keys were written once each and none deleted, so the store holds exactly the \
+             bytes it wrote and this ratio must be 1.000x. {} ppm means either the two halves are \
+             not in the same unit -- the defect this field exists to avoid -- or the fixture \
+             rewrote or reclaimed something and is no longer write-once.",
+            after.storage.lifetime_write_amplification_ppm,
+        );
+    } else {
+        println!("  lifetime write amplification not exercised: nothing is live on a slab yet");
+    }
+
     println!(
         "  logical write amplification {:.4}x  ({} physical / {} logical bytes written)",
         expected_write as f64 / 1_000_000.0,
@@ -7978,6 +8063,97 @@ fn the_published_amplification_ratios_are_the_ratio_they_name() {
         "the block store recorded no appends, so the physical term above is not a measurement of \
          this fixture's writes"
     );
+
+    // --- AND THE UNIT-MATCHED RATIO IS INVARIANT TO HOW WELL THE VALUES COMPRESS, which is the
+    // --- whole reason for matching the units, and is asserted on a SECOND corpus rather than
+    // --- argued from the first.
+    //
+    // `vec![b'v'; n]` is not a neutral fixture: a run of one repeated byte compresses to almost
+    // nothing, so `live_physical_bytes` above is mostly per-block framing rather than data. Any
+    // ratio with a stored-byte denominator sits on that, and one with an UNCOMPRESSED numerator
+    // moves by the compression factor when the corpus changes compressibility. This one must not
+    // move at all: on a store written once and never deleted, the bytes live ARE the bytes
+    // written, whatever they compressed to.
+    //
+    // The values here are a byte sequence with no short run and no small period, so the codec has
+    // nothing to take. If this arm ever reports the two stores' live bytes as equal, the second
+    // corpus did not actually resist compression and the invariance below is untested.
+    let incompressible_dir = tempfile::tempdir().expect("tempdir");
+    let incompressible = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        incompressible_dir.path().join("cache"),
+        incompressible_dir.path().join("pages"),
+        incompressible_dir.path().join("indexes"),
+    );
+    incompressible.load_shard(1);
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    for index in 0..200 {
+        let value: Vec<u8> = (0..256)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect();
+        let response = incompressible.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: format!("inc-{index:06}"), value },
+        });
+        assert!(response.status.ok, "incompressible write {index}: {:?}", response.status);
+    }
+    let incompressible_stats = incompressible.shard_stats(1).expect("a loaded shard reports stats");
+    let incompressible_slabs = incompressible.block_store.slab_summary();
+    println!(
+        "  incompressible corpus: {} live physical bytes against {} for the repeated-byte corpus \
+         ({:.1}x the stored footprint for the same 51,200 user bytes)",
+        incompressible_slabs.live_physical_bytes,
+        slabs.live_physical_bytes,
+        incompressible_slabs.live_physical_bytes as f64 / slabs.live_physical_bytes.max(1) as f64,
+    );
+    println!(
+        "    lifetime write amplification {:.4}x  -- unchanged, because both halves are stored bytes",
+        incompressible_stats.storage.lifetime_write_amplification_ppm as f64 / 1_000_000.0,
+    );
+    // THE DENOMINATOR REALLY DID MOVE. Without this, a second corpus that happened to compress the
+    // same way would satisfy the invariance below for the wrong reason.
+    assert!(
+        incompressible_slabs.live_physical_bytes > slabs.live_physical_bytes * 2,
+        "the incompressible corpus stored {} physical bytes against {} for the repeated-byte one. \
+         They are too close for this pair to test compressibility-invariance: the second fixture \
+         compressed after all, and the assertion below would pass without exercising anything.",
+        incompressible_slabs.live_physical_bytes,
+        slabs.live_physical_bytes,
+    );
+    assert_eq!(
+        1_000_000, incompressible_stats.storage.lifetime_write_amplification_ppm,
+        "the unit-matched write ratio read {} ppm on an incompressible write-once corpus where it \
+         reads 1.000x on a compressible one. Both halves are stored bytes, so the compression \
+         factor must cancel -- if it does not, the numerator and denominator are not in the same \
+         unit and this field has the defect it was added to avoid.",
+        incompressible_stats.storage.lifetime_write_amplification_ppm,
+    );
+    // AND THE MIXED-UNIT SPELLING WOULD HAVE MOVED, which is what makes the invariance a finding
+    // rather than an accident of this fixture.
+    let mixed_unit_here = incompressible
+        .block_store
+        .stats()
+        .logical_bytes_written
+        .saturating_mul(1_000_000)
+        / incompressible_slabs.live_physical_bytes.max(1);
+    let mixed_unit_there =
+        store.logical_bytes_written.saturating_mul(1_000_000) / slabs.live_physical_bytes.max(1);
+    println!(
+        "    the MIXED-UNIT ratio would read {:.3}x here against {:.3}x there -- it tracks the \
+         codec, not the rewrites",
+        mixed_unit_here as f64 / 1_000_000.0,
+        mixed_unit_there as f64 / 1_000_000.0,
+    );
+    assert_ne!(
+        mixed_unit_here, mixed_unit_there,
+        "the mixed-unit ratio came out the same on both corpora, so this pair does not demonstrate \
+         that matching the units is what bought the invariance"
+    );
 }
 
 /// THE AMPLIFICATION SET IN THE PUBLISHED FORMAT: three ppm ratios, two subsystems, two media.
@@ -7996,13 +8172,24 @@ fn the_published_amplification_ratios_are_the_ratio_they_name() {
 /// three land in the same order of magnitude, so a figure carrying one name while computing another
 /// is wrong in a way no range check catches.
 ///
-/// THIS ENGINE PUBLISHES THE SECOND UNDER THE FIRST'S NAME.
+/// THIS ENGINE PUBLISHED THE SECOND UNDER THE FIRST'S NAME, AND NOW PUBLISHES BOTH CORRECTLY.
 /// `ShardStats.storage.logical_write_amplification_ppm` computes `ppm(bytes_written,
 /// logical_bytes_written)` -- physical over logical -- which is `storage_write_amplification_ppm`.
+/// That field now exists and carries the same value under the name that describes it; the older
+/// spelling keeps its value because it is a serde key travelling to the meta server, where a
+/// re-pointed key would decode into the right shape with the wrong contents.
+///
+/// THE FIRST RATIO IS NOT PUBLISHED AT ALL, DELIBERATELY. Its two halves are in different units
+/// here: `logical_bytes_written` is uncompressed and every live figure this crate maintains is
+/// COMPRESSED stored bytes, so the quotient multiplies the real figure by the compression factor
+/// -- 7.314x on the corpus below, which rewrote nothing. `lifetime_write_amplification_ppm` answers
+/// the question that ratio is asked for, with stored bytes on both sides, and reads 1.000x here.
+/// Matching the units the other way needs an uncompressed size on the object record, which costs
+/// 4-8 B per object. Both figures are printed below so the difference is a number.
+///
 /// `the_published_amplification_ratios_are_the_ratio_they_name` asserts the implementation matches
-/// that name's own arithmetic and so passes: it pins self-consistency, not agreement with the
-/// definition the name was taken from. This arm computes all three the defined way and prints the
-/// published figure beside them, so the disagreement is a number rather than a reading of the code.
+/// each name's own arithmetic: it pins self-consistency, not agreement with the definition the
+/// name was taken from, and it passed throughout the period the name was wrong.
 ///
 /// rust-internal: measures this crate's own counters, no product behaviour
 ///
@@ -8129,24 +8316,33 @@ fn the_amplification_set_in_the_published_format() {
     println!();
     println!("  WHAT THIS ENGINE PUBLISHES, beside the same quantity computed the defined way:");
     println!(
-        "    published logical_write_amplification_ppm {:>9}  ({:.3}x)",
+        "    logical_write_amplification_ppm (frozen) {:>9}  ({:.3}x)",
         published.logical_write_amplification_ppm,
         as_x(published.logical_write_amplification_ppm)
     );
     println!(
-        "      .. equals the DEFINED storage_write ratio: {}",
-        published.logical_write_amplification_ppm == payload_storage_write
+        "    storage_write_amplification_ppm          {:>9}  ({:.3}x)   agrees: {}",
+        published.storage_write_amplification_ppm,
+        as_x(published.storage_write_amplification_ppm),
+        published.storage_write_amplification_ppm == payload_storage_write
     );
     println!(
-        "      .. equals the DEFINED logical_write ratio: {}",
-        published.logical_write_amplification_ppm == payload_logical_write
+        "    lifetime_write_amplification_ppm             {:>9}  ({:.3}x)   written / live",
+        published.lifetime_write_amplification_ppm,
+        as_x(published.lifetime_write_amplification_ppm)
     );
     println!(
-        "    published space_amplification_ppm          {:>9}  ({:.3}x)   agrees: {}",
+        "    space_amplification_ppm                  {:>9}  ({:.3}x)   agrees: {}",
         published.space_amplification_ppm,
         as_x(published.space_amplification_ppm),
         published.space_amplification_ppm == payload_space
     );
+    println!(
+        "      the MIXED-UNIT logical_write would be {payload_logical_write} ppm ({:.3}x) -- \
+         uncompressed",
+        as_x(payload_logical_write)
+    );
+    println!("      bytes written over COMPRESSED bytes live, which is why it is not published");
 
     // --- DENOMINATORS FIRST, so no identity below can be satisfied by 0 == 0.
     assert!(logical_written > 0, "nothing logical was written, so every payload ratio is vacuous");
@@ -8172,22 +8368,52 @@ fn the_amplification_set_in_the_published_format() {
         );
     }
 
-    // --- THE MISMATCH, ASSERTED SO IT CANNOT BE FIXED WITHOUT THIS ARM NOTICING. The published
-    // --- figure is the storage-write ratio wearing the logical-write ratio's name. When that is
-    // --- corrected, this arm fails and says so -- which is the point: it is a record of a known
-    // --- disagreement, not an endorsement of it.
     assert_eq!(
         published.space_amplification_ppm, payload_space,
         "the published space ratio no longer matches the defined one (physical resident over \
-         live). That ratio DID agree, so this is a regression rather than the known mismatch."
+         live). That ratio has always agreed, so this is a regression."
     );
+
+    // --- THE MISMATCH THIS ARM RECORDED IS FIXED, AND THIS IS WHAT REPLACED THE RECORD OF IT.
+    // --- Until the correction, the only published write ratio was `logical_write_amplification_ppm`
+    // --- carrying physical-over-logical, and this arm asserted that mismatch so it could not be
+    // --- fixed silently. The quantity now has a field whose NAME describes it, and the assertion
+    // --- is agreement rather than disagreement.
+    assert_eq!(
+        published.storage_write_amplification_ppm, payload_storage_write,
+        "`storage_write_amplification_ppm` must equal the DEFINED storage-write ratio \
+         ({payload_storage_write} ppm, physical written over logical written) and published {} \
+         instead.",
+        published.storage_write_amplification_ppm
+    );
+    // AND THE OLD NAME'S VALUE IS FROZEN. It is a serde key that travels to the meta server, so a
+    // consumer reading it must keep getting the quantity it has always got. If this fails, the
+    // field was re-pointed and every such reader silently changed meaning.
     assert_eq!(
         published.logical_write_amplification_ppm, payload_storage_write,
-        "the published `logical_write_amplification_ppm` no longer equals the DEFINED \
-         storage-write ratio. If it now equals the defined logical-write ratio instead \
-         ({payload_logical_write} ppm), the mismatch this arm records has been FIXED -- update \
-         this assertion to require agreement with the ratio it names, and say so in the module \
-         note above."
+        "`logical_write_amplification_ppm` is misnamed and its VALUE is deliberately frozen at the \
+         storage-write ratio ({payload_storage_write} ppm) because the name is a wire key. It \
+         published {} instead. If this was a deliberate re-pointing, it is a breaking change to \
+         every consumer of that key and needs to be taken as one rather than landed here.",
+        published.logical_write_amplification_ppm
+    );
+    // AND THE UNIT-MATCHED RATIO IS 1.0x ON A WRITE-ONCE CORPUS. This is the assertion that
+    // distinguishes it from the ratio above: the corpus is written once and nothing is deleted, so
+    // the store holds exactly the bytes it wrote. The mixed-unit spelling reads 7.3x here.
+    assert_eq!(
+        1_000_000,
+        published.lifetime_write_amplification_ppm,
+        "every key was written once and none deleted, so written-over-live must be 1.000x and {} \
+         ppm was published. The mixed-unit ratio -- logical bytes written over COMPRESSED live \
+         bytes -- reads {payload_logical_write} ppm on this same corpus, which is the compression \
+         factor and not a rewrite; that is the reading this field exists to avoid.",
+        published.lifetime_write_amplification_ppm
+    );
+    assert_ne!(
+        published.lifetime_write_amplification_ppm, payload_logical_write,
+        "the unit-matched write ratio and the mixed-unit one came out equal, so this corpus cannot \
+         tell them apart and the distinction the field rests on is untested here. It needs a \
+         corpus whose compression factor is not 1."
     );
 }
 
@@ -9087,5 +9313,143 @@ fn what_merging_the_key_sharing_maps_would_cost_as_a_record() {
         "a disjoint population was expected to COST bytes in the record shape -- four maps \
          {disjoint_maps} B, two records {disjoint_records} B. With both ends the same sign there \
          is no crossover to report and the arm's conclusion does not follow."
+    );
+}
+
+/// THE LIVE DENOMINATOR MUST FALL WHEN A KEY IS OVERWRITTEN, AND THE PUBLISHED ONE DOES NOT.
+///
+/// `lifetime_write_amplification_ppm` claims to say how many times over the store has written the
+/// data it is holding. That claim is only testable by REWRITING, and the obvious denominator fails
+/// it: `summarize_slabs` adds a slab's whole `physical_bytes` to `live_physical_bytes` for every
+/// Active or Sealed slab, so "live" means "in a slab not awaiting destruction" and a slab counts
+/// fully live however many of its blocks are dead.
+///
+/// So `live_physical_bytes` tracks `bytes_written` to the byte under rewrite, and every ratio over
+/// it is pinned at 1.000x. This arm measures both denominators side by side across five full
+/// rewrites and asserts the asymmetry: the slab-granular one must stay pinned, and the published
+/// field -- which uses the index's own block-granular tally -- must reach 5.0x.
+///
+/// WHY BOTH HALVES ARE ASSERTED. "The ratio moved" alone would pass if the coarse denominator had
+/// quietly started working; "the coarse one is pinned" alone would pass if the field were broken in
+/// the same way. Together they say the field is on the right denominator AND that the choice still
+/// matters. If this arm fails because the slab summary began falling under rewrite, the right fix
+/// is to re-read the summary rather than to loosen this.
+///
+/// VALUES ARE INCOMPRESSIBLE AND DIFFER EVERY ROUND, so nothing can be deduplicated and a round's
+/// physical cost cannot be absorbed by the codec -- the denominator has to move for structural
+/// reasons, not because the data got smaller.
+///
+/// rust-internal: measures this crate's own counters, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib the_live_denominator_must_fall_when_a_key_is_overwritten -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "rewrites a corpus five times; run by name"]
+fn the_live_denominator_must_fall_when_a_key_is_overwritten() {
+    use crate::types::{Command, ExecuteRequest};
+    const KEYS: usize = 2_000;
+    const ROUNDS: u64 = 5;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), 1023);
+    let mut seed: u64 = 0x243F6A8885A308D3;
+    let mut next_value = move || -> Vec<u8> {
+        (0..256)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+
+    println!();
+    println!("  THE SAME CORPUS REWRITTEN, AGAINST TWO DENOMINATORS FOR 'LIVE'");
+    println!();
+    println!(
+        "  {:>5} {:>13} {:>13} {:>10} {:>13} {:>10} {:>11}",
+        "round", "written", "slab live", "slab x", "index live", "index x", "published x"
+    );
+
+    let mut first_index_live = 0u64;
+    let mut last = (0u64, 0u64, 0u64, 0u64);
+    for round in 1..=ROUNDS {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("rw-{index:06}"),
+                    value: next_value(),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+        let store = engine.block_store.stats();
+        let slabs = engine.block_store.slab_summary();
+        let (index_live, ready) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let live = &shard.bucket_index.block_slab_live;
+            (live.iter().map(|(_, tally)| tally.bytes).sum::<u64>(), live.is_ready())
+        };
+        assert!(ready, "round {round}: the per-slab live tally is not ready, so its column is 0 by \
+                        construction and the comparison below is vacuous");
+        let published = engine.shard_stats(1).expect("a loaded shard reports stats").storage.clone();
+        if round == 1 {
+            first_index_live = index_live;
+        }
+        println!(
+            "  {round:>5} {:>13} {:>13} {:>10.3} {:>13} {:>10.3} {:>11.3}",
+            store.bytes_written,
+            slabs.live_physical_bytes,
+            store.bytes_written as f64 / slabs.live_physical_bytes.max(1) as f64,
+            index_live,
+            store.bytes_written as f64 / index_live.max(1) as f64,
+            published.lifetime_write_amplification_ppm as f64 / 1_000_000.0,
+        );
+        last = (store.bytes_written, slabs.live_physical_bytes, index_live, published.lifetime_write_amplification_ppm);
+    }
+    println!();
+
+    let (written, slab_live, index_live, published_ppm) = last;
+    assert!(written > 0 && index_live > 0, "nothing was written or nothing is live; every ratio below is vacuous");
+
+    // --- THE LIVE SET DID NOT GROW. Every round overwrites the same keys, so the index's live
+    // --- tally must hold steady -- if it grew, the fixture wrote new keys and the rewrite this arm
+    // --- depends on did not happen.
+    assert_eq!(
+        first_index_live, index_live,
+        "the index's live bytes went {first_index_live} -> {index_live} across {ROUNDS} rounds that \
+         overwrite the SAME {KEYS} keys. The live set must not grow, or these are not rewrites and \
+         the amplification below is just more data."
+    );
+
+    // --- THE SLAB-GRANULAR DENOMINATOR IS PINNED. This is the defect, asserted so that the field
+    // --- above cannot be quietly re-pointed back onto it.
+    assert_eq!(
+        written, slab_live,
+        "`live_physical_bytes` was expected to track `bytes_written` to the byte under rewrite -- \
+         {written} written against {slab_live} live -- because a slab counts fully live however \
+         many of its blocks are dead. If these have diverged, the slab summary started seeing dead \
+         blocks and the caveat on `space_amplification_ppm` should be re-measured, not relaxed."
+    );
+
+    // --- AND THE PUBLISHED FIELD IS ON THE DENOMINATOR THAT MOVES. Five rounds of rewrite over an
+    // --- unchanging live set is exactly 5.0x.
+    let expected_ppm = written.saturating_mul(1_000_000) / index_live;
+    assert_eq!(
+        expected_ppm, published_ppm,
+        "the published lifetime write amplification is {published_ppm} ppm and the index's own \
+         tally gives {expected_ppm} ppm ({written} written over {index_live} live). If the field \
+         reports {} ppm instead, it is back on the slab-granular denominator and can no longer \
+         leave 1.0x.",
+        written.saturating_mul(1_000_000) / slab_live.max(1)
+    );
+    assert_eq!(
+        ROUNDS * 1_000_000,
+        published_ppm,
+        "{ROUNDS} rewrites of an unchanging live set must read exactly {ROUNDS}.000x and the field \
+         published {published_ppm} ppm"
     );
 }
